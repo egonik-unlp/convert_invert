@@ -184,7 +184,7 @@ impl Managers {
         let (shutdown_sender, shutdown_receiver) = tokio::sync::mpsc::channel(2);
         let shutdown_sender = Arc::new(shutdown_sender);
         let search_semaphore = Arc::new(Semaphore::new(4));
-        let download_semaphore = Arc::new(Semaphore::new(5));
+        let download_semaphore = Arc::new(Semaphore::new(7));
         let manager_span = info_span!("context-span");
         let task_manager: JoinHandle<anyhow::Result<()>> = tokio::spawn(
             async move {

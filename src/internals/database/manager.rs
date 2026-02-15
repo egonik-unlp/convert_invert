@@ -56,16 +56,34 @@ impl<'a> DatabaseManager<'a> {
         Ok(downloadable_id)
     }
 
+    fn update_jugde_submission_score(
+        connection: &mut PgConnection,
+        judge_submission: &RuntimeJudgeSubmission,
+    ) -> anyhow::Result<()> {
+        let judge_submission_id = Self::get_judge_submission_id(connection, judge_submission)?;
+        diesel::update(
+            schema::judge_submissions::table
+                .filter(schema::judge_submissions::id.eq(&judge_submission_id)),
+        )
+        .set(schema::judge_submissions::score.eq(judge_submission.score))
+        .execute(connection)
+        .context("update and set score")?;
+        Ok(())
+    }
     fn insert_judge_submission(
         connection: &mut PgConnection,
         judge_submission: &RuntimeJudgeSubmission,
     ) -> anyhow::Result<i32> {
         use schema::judge_submissions::dsl as js;
-        let track_id = Self::get_search_item_id(connection, &judge_submission.track)?;
-        let query_id = Self::insert_downloadable_file(connection, &judge_submission.query)?;
+        let track_id = Self::get_search_item_id(connection, &judge_submission.track)
+            .with_context(|| format!("fetching track_id={:?}", judge_submission.track))?;
+        let query_id = Self::insert_downloadable_file(connection, &judge_submission.query)
+            .with_context(|| format!("fetching track_id={:?}", judge_submission.query))?;
+
         let value = model::NewJudgeSubmissionRow {
             track: track_id,
             query: query_id,
+            score: None,
         };
         let inserted_id = insert_into(schema::judge_submissions::table)
             .values(&value)
@@ -74,6 +92,7 @@ impl<'a> DatabaseManager<'a> {
             .context("Insert judge submission")?;
         Ok(inserted_id)
     }
+    // BUG: ERROR HERE
     fn get_judge_submission_id(
         connection: &mut PgConnection,
         judge_submission: &RuntimeJudgeSubmission,
@@ -89,13 +108,13 @@ impl<'a> DatabaseManager<'a> {
             .context("Getting download id in js")?;
 
         let judge_id = schema::judge_submissions::table
-            .filter(js::track.eq(track_id))
+            .filter(js::query.eq(track_id))
             .select(js::id)
             .get_result(connection)
             .with_context(|| {
                 format!(
-                    "fetch judge id from db JSGET, track:\n{:?}",
-                    judge_submission
+                    "fetch judge id from db JSGET, track:\n{:?} track_id:\n{:?}",
+                    judge_submission, track_id
                 )
             })?;
         Ok(judge_id)
@@ -153,8 +172,11 @@ impl<'a> DatabaseManager<'a> {
                     Track::Query(search_item) => {
                         Self::insert_search_item(connection, search_item)?;
                     }
-                    Track::Result(judge_submission) | Track::Downloadable(judge_submission) => {
+                    Track::Result(judge_submission) => {
                         Self::insert_judge_submission(connection, judge_submission)?;
+                    }
+                    Track::Downloadable(judge_submission) => {
+                        Self::update_jugde_submission_score(connection, judge_submission)?;
                     }
                     Track::File(downloaded_file) => {
                         let value = model::NewDownloadedFileRow::from(downloaded_file);
@@ -173,6 +195,7 @@ impl<'a> DatabaseManager<'a> {
                 }
                 Ok(())
             })
+            //BUG: Explodes here
             .context("Persist track into database")?;
         Ok(())
     }

@@ -27,6 +27,7 @@ diesel::table! {
         id -> Int4,
         track -> Int4,
         query -> Int4,
+        score -> Nullable<Float4>,
     }
 }
 

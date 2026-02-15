@@ -117,6 +117,7 @@ pub struct JudgeSubmissionRow {
     pub id: i32,
     pub track: i32,
     pub query: i32,
+    pub score: Option<f32>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -124,6 +125,7 @@ pub struct JudgeSubmissionRow {
 pub struct NewJudgeSubmissionRow {
     pub track: i32,
     pub query: i32,
+    pub score: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +140,7 @@ impl From<JudgeSubmissionJoined> for RuntimeJudgeSubmission {
         Self {
             track: value.track.into(),
             query: value.query.into(),
+            score: None,
         }
     }
 }

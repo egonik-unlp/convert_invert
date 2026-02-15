@@ -36,17 +36,19 @@ impl JudgeManager {
         sender: Arc<Sender<Track>>,
     ) -> anyhow::Result<()> {
         tracing::info!("received in judge manager = {:?}", track);
+        let mut inner_track = track.clone();
         let response = self
             .method
             .judge_score(track.clone())
             .await
             .context("awaiting judge response")?;
+        inner_track.score = Some(response);
         if response > 0.75 {
-            send(Track::Downloadable(track), &sender)
+            send(Track::Downloadable(inner_track), &sender)
                 .await
                 .context("sending judgement")?;
         } else {
-            let reject = RejectedTrack::new(track, RejectReason::LowScore(response));
+            let reject = RejectedTrack::new(inner_track, RejectReason::LowScore(response));
             send(Track::Reject(reject), &sender)
                 .await
                 .context("sending reject")?;

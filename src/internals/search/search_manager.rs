@@ -83,10 +83,16 @@ impl Display for SearchItem {
         write!(f, "{} - {} - {}", self.track, self.artist, self.album)
     }
 }
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JudgeSubmission {
     pub track: SearchItem,
     pub query: DownloadableFile,
+    pub score: Option<f32>,
+}
+impl PartialEq for JudgeSubmission {
+    fn eq(&self, other: &Self) -> bool {
+        self.track.eq(&other.track) && self.query.eq(&other.query)
+    }
 }
 
 pub struct SearchManager {
@@ -112,6 +118,7 @@ impl SearchManager {
                     username: f.username,
                 },
                 track: track.clone(),
+                score: None,
             })
             .collect()
     }
