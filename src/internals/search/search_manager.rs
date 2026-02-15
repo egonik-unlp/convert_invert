@@ -121,16 +121,13 @@ impl SearchManager {
         count_cutoff: usize,
         semaphore: Arc<Semaphore>,
         sender: Arc<Sender<Track>>,
-    ) -> anyhow::Result<JoinHandle<anyhow::Result<()>>> {
+    ) -> anyhow::Result<()> {
         let client = self.client.clone();
-        let hand: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            let _permit = semaphore.acquire().await.context("Getting permit")?;
-            track_search_task(client, track, count_cutoff, sender)
-                .await
-                .context("Track search context")?;
-            Ok(())
-        });
-        Ok(hand)
+        let _permit = semaphore.acquire().await.context("Getting permit")?;
+        track_search_task(client, track, count_cutoff, sender)
+            .await
+            .context("TST")?;
+        Ok(())
     }
 }
 

@@ -78,18 +78,26 @@ impl<'a> DatabaseManager<'a> {
         connection: &mut PgConnection,
         judge_submission: &RuntimeJudgeSubmission,
     ) -> anyhow::Result<i32> {
+        use schema::downloadable_files::dsl as df;
         use schema::judge_submissions::dsl as js;
-        use schema::search_items::dsl as si;
-        let search_id: i32 = schema::search_items::table
-            .filter(si::track_id.eq(judge_submission.track.track_id))
-            .select(si::id)
+        let track_id: i32 = schema::downloadable_files::table
+            .filter(df::filename.eq(&judge_submission.query.filename))
+            .filter(df::username.eq(&judge_submission.query.username))
+            .filter(df::size.eq(judge_submission.query.size))
+            .select(df::id)
             .get_result(connection)
-            .context("fetch search id from db JSGet")?;
+            .context("Getting download id in js")?;
+
         let judge_id = schema::judge_submissions::table
-            .filter(js::track.eq(search_id))
+            .filter(js::track.eq(track_id))
             .select(js::id)
             .get_result(connection)
-            .context("fetch judge id from db JSGET")?;
+            .with_context(|| {
+                format!(
+                    "fetch judge id from db JSGET, track:\n{:?}",
+                    judge_submission
+                )
+            })?;
         Ok(judge_id)
     }
 
@@ -161,6 +169,7 @@ impl<'a> DatabaseManager<'a> {
                     Track::Reject(rejected_track) => {
                         Self::insert_rejected_track(connection, rejected_track)?;
                     }
+                    Track::NoMoreTracks => (),
                 }
                 Ok(())
             })

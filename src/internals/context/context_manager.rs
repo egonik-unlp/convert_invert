@@ -2,7 +2,14 @@ use crate::internals::database::manager::DatabaseManager;
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{
         RwLock, Semaphore,
@@ -10,7 +17,7 @@ use tokio::{
     },
     task::{JoinHandle, JoinSet},
 };
-use tracing::instrument;
+use tracing::{Instrument, info_span, instrument};
 
 use anyhow::Context;
 
@@ -42,6 +49,7 @@ pub enum Track {
     File(DownloadedFile),
     Retry(RetryRequest),
     Reject(RejectedTrack),
+    NoMoreTracks,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,6 +121,7 @@ impl RunTools {
 pub enum QueuePriority {
     NormalRun(JoinHandle<anyhow::Result<()>>),
     RetryRun(JoinHandle<anyhow::Result<()>>),
+    Terminate,
 }
 
 impl Managers {
@@ -153,6 +162,7 @@ impl Managers {
         for track in track_chunk {
             send(track, &sender).await.unwrap();
         }
+        send(Track::NoMoreTracks, &sender).await.unwrap();
         Ok(sender)
     }
 
@@ -171,16 +181,20 @@ impl Managers {
         let storage = Vec::new();
         let state = Arc::new(RwLock::new(storage));
         let (task_sender, task_receiver) = mpsc::channel(300);
-
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::mpsc::channel(2);
+        let shutdown_sender = Arc::new(shutdown_sender);
         let search_semaphore = Arc::new(Semaphore::new(4));
         let download_semaphore = Arc::new(Semaphore::new(5));
-        let task_manager: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-            await_pending_tasks(task_receiver)
-                .await
-                .context("Awaiting tasks")?;
-            Ok(())
-        });
-
+        let manager_span = info_span!("context-span");
+        let task_manager: JoinHandle<anyhow::Result<()>> = tokio::spawn(
+            async move {
+                await_pending_tasks(task_receiver, shutdown_receiver)
+                    .await
+                    .context("Awaiting tasks")?;
+                Ok(())
+            }
+            .instrument(manager_span),
+        );
         while let Some(track) = receiver.recv().await {
             tracing::info!(?track, "Incoming package");
             let task_queue = task_sender.clone();
@@ -198,10 +212,7 @@ impl Managers {
                             .search_manager
                             .run(search_item, 0, semaphore, sender)
                             .await
-                            .context("returning track")?
-                            .await
-                            .context("inner")?
-                            .context("one more")?;
+                            .context("returning track")?;
                         Ok(())
                     });
                     tokio::time::sleep(Duration::from_secs(3)).await;
@@ -290,28 +301,66 @@ impl Managers {
                     tracing::info!(?retry_request, "Retry requestedfile")
                 }
                 Track::Reject(_rejected_track) => {}
+                Track::NoMoreTracks => {
+                    let shutdown_sender = Arc::clone(&shutdown_sender);
+                    shutdown_sender.send(true).await.unwrap()
+                }
             };
         }
-        task_manager.await.context("Awaiting")?.context("Inner")?;
+        task_sender
+            .send(QueuePriority::Terminate)
+            .await
+            .context("sending shutdown signal")?;
+        drop(task_sender);
+        drop(sender);
+        task_manager
+            .await
+            .context("Awaiting task manager shutdown")?
+            .context("Inner")?;
         Ok(())
     }
 }
 
-pub async fn await_pending_tasks(mut receiver: Receiver<QueuePriority>) -> anyhow::Result<()> {
+#[instrument(name = "task manager", skip(receiver, shutdown_receiver))]
+pub async fn await_pending_tasks(
+    mut receiver: Receiver<QueuePriority>,
+    mut shutdown_receiver: Receiver<bool>,
+) -> anyhow::Result<()> {
     let mut set = JoinSet::new();
+    let mut jset = JoinSet::new();
     let mut retries_queue = vec![];
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let sht = Arc::clone(&shutdown);
+    jset.spawn(async move {
+        if let Some(_val) = shutdown_receiver.recv().await {
+            sht.fetch_not(Ordering::SeqCst);
+        }
+    });
     while let Some(msg) = receiver.recv().await {
         match msg {
             QueuePriority::NormalRun(join_handle) => {
                 set.spawn(async move { join_handle.await.context("Awaiting handle")? });
+                in_flight.fetch_add(1, Ordering::SeqCst);
+                tracing::info!(?shutdown, ?in_flight, "state in manager");
+                if shutdown.clone().load(Ordering::SeqCst) && in_flight.load(Ordering::SeqCst) == 0
+                {
+                    tracing::info!(?shutdown, ?in_flight, "This actually worked");
+                    jset.abort_all();
+                    break;
+                }
             }
             QueuePriority::RetryRun(join_handle) => retries_queue.push(join_handle),
+            QueuePriority::Terminate => break,
         }
     }
 
     while let Some(res) = set.join_next().await {
         res.context("Failed returning from task")?
             .context("inner")?;
+        let _guard = scopeguard::guard((), |_| {
+            Arc::clone(&in_flight).fetch_sub(1, Ordering::SeqCst);
+        });
     }
     for task in retries_queue {
         task.await.context("Awaiting retry")?.context("inner")?;
