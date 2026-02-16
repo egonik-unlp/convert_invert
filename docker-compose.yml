@@ -1,6 +1,5 @@
-version: "3.8"
-
 services:
+
   jaeger:
     image: jaegertracing/all-in-one:latest
     ports:
@@ -14,8 +13,8 @@ services:
     ports:
       - "5000:3000"
     environment:
-        GF_SECURITY_ADMIN_USER: egonik
-        GF_SECURITY_ADMIN_PASSWORD: HisPro10
+      GF_SECURITY_ADMIN_USER: egonik
+      GF_SECURITY_ADMIN_PASSWORD: HisPro10
   db:
     image: postgres
     restart: always
@@ -29,3 +28,14 @@ services:
     restart: always
     ports:
       - 8080:8080
+  redis:
+    image: redis:7.4-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --save 20 1 --loglevel warning 
+    volumes:
+      - redis_data:/data
+volumes:
+  redis_data:
+    driver: local

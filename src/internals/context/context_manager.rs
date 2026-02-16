@@ -166,12 +166,16 @@ impl Managers {
         Ok(sender)
     }
 
-    #[instrument(name = "run-cyle", skip(self, sender, receiver, connection))]
+    #[instrument(
+        name = "run-cyle",
+        skip(self, sender, receiver, connection, redis_client)
+    )]
     pub async fn run_cycle(
         self,
         sender: Sender<Track>,
         mut receiver: Receiver<Track>,
         connection: &mut PgConnection,
+        redis_client: redis::Client,
     ) -> anyhow::Result<()> {
         let managers = Arc::new(self);
         let mut database_manager = DatabaseManager::new(connection);
@@ -195,117 +199,135 @@ impl Managers {
             }
             .instrument(manager_span),
         );
-        while let Some(track) = receiver.recv().await {
-            tracing::info!(?track, "Incoming package");
-            let task_queue = task_sender.clone();
-            database_manager
-                .load_item_to_database(&track)
-                .context("Load into database")?;
-            match track {
-                Track::Query(search_item) => {
-                    let managers = Arc::clone(&managers);
-                    let sender = Arc::clone(&sender);
-                    let semaphore = search_semaphore.clone();
-                    tracing::info!(?search_item, "Enter search_item");
-                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                        managers
-                            .search_manager
-                            .run(search_item, 0, semaphore, sender)
-                            .await
-                            .context("returning track")?;
-                        Ok(())
-                    });
-                    tokio::time::sleep(Duration::from_secs(3)).await;
-                    task_queue
-                        .send(QueuePriority::NormalRun(handle))
-                        .await
-                        .context("Submitting task to queue")?;
-                }
-                Track::Result(judge_submission) => {
-                    let managers = Arc::clone(&managers);
-                    let sender = Arc::clone(&sender);
-                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                        tracing::info!(?judge_submission, "Enter result");
-                        managers
-                            .judge_manager
-                            .run(judge_submission, sender)
-                            .await
-                            .context("Returning judge_submission")?;
-                        Ok(())
-                    });
-                    handle.await.context("handle-revisar")?.context("inner")?;
-                }
-                Track::Downloadable(judge_submission) => {
-                    let semaphore = download_semaphore.clone();
-                    let managers = Arc::clone(&managers);
-                    let sender = Arc::clone(&sender);
-                    tracing::info!(?judge_submission, "Enter downloadable");
-                    let judge_sub = judge_submission.clone();
-                    if !state.read().await.contains(&judge_submission.track) {
-                        let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                            managers
-                                .download_manager
-                                .run(judge_sub, semaphore, sender)
-                                .await
-                                .context("Downloading")?;
-                            Ok(())
-                        });
-                        task_queue
-                            .send(QueuePriority::NormalRun(handle))
-                            .await
-                            .context("Submitting task to queue")?;
-                    } else {
-                        let reject = RejectedTrack::new(
-                            judge_submission.clone(),
-                            RejectReason::AlreadyDownloaded,
-                        );
-                        send(Track::Reject(reject), &sender)
-                            .await
-                            .context("sending rejected_tracks")?;
+        loop {
+            tokio::select! {
+                maybe_msg = receiver.recv() => {
+                    match maybe_msg {
+                        None => {
+                            println!("I do not expect to get here, ever");
+                            break;
+                        }
+                        Some(track) => {
+                            tracing::info!(?track, "Incoming package");
+                            let task_queue = task_sender.clone();
+                            database_manager
+                                .load_item_to_database(&track)
+                                .context("Load into database")?;
+                            match track {
+                                Track::Query(search_item) => {
+                                    let managers = Arc::clone(&managers);
+                                    let sender = Arc::clone(&sender);
+                                    let semaphore = search_semaphore.clone();
+                                    tracing::info!(?search_item, "Enter search_item");
+                                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                                        managers
+                                            .search_manager
+                                            .run(search_item, 0, semaphore, sender)
+                                            .await
+                                            .context("returning track")?;
+                                        Ok(())
+                                    });
+                                    tokio::time::sleep(Duration::from_secs(3)).await;
+                                    task_queue
+                                        .send(QueuePriority::NormalRun(handle))
+                                        .await
+                                        .context("Submitting task to queue")?;
+                                }
+                                Track::Result(judge_submission) => {
+                                    let managers = Arc::clone(&managers);
+                                    let sender = Arc::clone(&sender);
+                                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                                        tracing::info!(?judge_submission, "Enter result");
+                                        managers
+                                            .judge_manager
+                                            .run(judge_submission, sender)
+                                            .await
+                                            .context("Returning judge_submission")?;
+                                        Ok(())
+                                    });
+                                    handle.await.context("handle-revisar")?.context("inner")?;
+                                }
+                                Track::Downloadable(judge_submission) => {
+                                    let semaphore = download_semaphore.clone();
+                                    let managers = Arc::clone(&managers);
+                                    let sender = Arc::clone(&sender);
+                                    tracing::info!(?judge_submission, "Enter downloadable");
+                                    let judge_sub = judge_submission.clone();
+                                    if !state.read().await.contains(&judge_submission.track) {
+                                        let redis_client = redis_client.clone();
+                                        let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                                            managers
+                                                .download_manager
+                                                .run(judge_sub, semaphore, sender, redis_client)
+                                                .await
+                                                .context("Downloading")?;
+                                            Ok(())
+                                        });
+                                        task_queue
+                                            .send(QueuePriority::NormalRun(handle))
+                                            .await
+                                            .context("Submitting task to queue")?;
+                                    } else {
+                                        let reject = RejectedTrack::new(
+                                            judge_submission.clone(),
+                                            RejectReason::AlreadyDownloaded,
+                                        );
+                                        send(Track::Reject(reject), &sender)
+                                            .await
+                                            .context("sending rejected_tracks")?;
+                                    }
+                                    let mut write = state.write().await;
+                                    write.push(judge_submission.track);
+                                }
+                                Track::File(downloaded_file) => {
+                                    tracing::info!(?downloaded_file, "Downloaded file");
+                                }
+                                Track::Retry(mut retry_request) => {
+                                    if retry_request.retry_attempts >= 1 {
+                                        let reject = RejectedTrack::new(
+                                            retry_request.request,
+                                            RejectReason::AbandonedAttemptingSearch,
+                                        );
+                                        send(Track::Reject(reject), &sender)
+                                            .await
+                                            .context("rejecting")?;
+                                        continue;
+                                    }
+                                    retry_request.retry_attempts += 1;
+                                    let managers = Arc::clone(&managers);
+                                    let semaphore = search_semaphore.clone();
+                                    let sender = Arc::clone(&sender);
+                                    tracing::info!(?retry_request.request, "Retry zone");
+                                    let search_item = retry_request.request.clone();
+                                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                                        managers
+                                            .search_manager
+                                            .run(search_item.track, 1, semaphore, sender)
+                                            .await
+                                            .context("returning track")?;
+                                        Ok(())
+                                    });
+                                    task_queue
+                                        .send(QueuePriority::RetryRun(handle))
+                                        .await
+                                        .context("Submitting task to queue")?;
+                                    tracing::info!(?retry_request, "Retry requestedfile")
+                                }
+                                Track::Reject(_rejected_track) => {}
+                                Track::NoMoreTracks => {
+                                    println!("No more tracks signal received");
+                                    let shutdown_sender = Arc::clone(&shutdown_sender);
+                                    println!("Sent shutdown signal");
+                                    shutdown_sender.send(true).await.unwrap()
+                                }
+                            }
+                        }
                     }
-                    let mut write = state.write().await;
-                    write.push(judge_submission.track);
                 }
-                Track::File(downloaded_file) => {
-                    tracing::info!(?downloaded_file, "Downloaded file");
+                _ = tokio::time::sleep(Duration::from_secs(10 * 60)) => {
+                    break;
                 }
-                Track::Retry(mut retry_request) => {
-                    if retry_request.retry_attempts >= 1 {
-                        let reject = RejectedTrack::new(
-                            retry_request.request,
-                            RejectReason::AbandonedAttemptingSearch,
-                        );
-                        send(Track::Reject(reject), &sender)
-                            .await
-                            .context("rejecting")?;
-                        continue;
-                    }
-                    retry_request.retry_attempts += 1;
-                    let managers = Arc::clone(&managers);
-                    let semaphore = search_semaphore.clone();
-                    let sender = Arc::clone(&sender);
-                    tracing::info!(?retry_request.request, "Retry zone");
-                    let search_item = retry_request.request.clone();
-                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                        managers
-                            .search_manager
-                            .run(search_item.track, 1, semaphore, sender)
-                            .await
-                            .context("returning track")?;
-                        Ok(())
-                    });
-                    task_queue
-                        .send(QueuePriority::RetryRun(handle))
-                        .await
-                        .context("Submitting task to queue")?;
-                    tracing::info!(?retry_request, "Retry requestedfile")
-                }
-                Track::Reject(_rejected_track) => {}
-                Track::NoMoreTracks => {
-                    let shutdown_sender = Arc::clone(&shutdown_sender);
-                    shutdown_sender.send(true).await.unwrap()
-                }
-            };
+            }
         }
         task_sender
             .send(QueuePriority::Terminate)
@@ -334,7 +356,9 @@ pub async fn await_pending_tasks(
     let sht = Arc::clone(&shutdown);
     jset.spawn(async move {
         if let Some(_val) = shutdown_receiver.recv().await {
+            println!("Receiver, value: {}", _val);
             sht.fetch_not(Ordering::SeqCst);
+            println!("{}", sht.load(Ordering::SeqCst))
         }
     });
     while let Some(msg) = receiver.recv().await {

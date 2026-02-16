@@ -93,7 +93,7 @@ impl<'a> DatabaseManager<'a> {
         Ok(inserted_id)
     }
     // BUG: ERROR HERE
-    fn get_judge_submission_id(
+    pub fn get_judge_submission_id(
         connection: &mut PgConnection,
         judge_submission: &RuntimeJudgeSubmission,
     ) -> anyhow::Result<i32> {
