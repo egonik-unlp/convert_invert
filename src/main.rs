@@ -42,28 +42,27 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let playlist = managers.get_playlist().await;
-    let random_start = loop {
-        let rn = rand::random::<u16>();
-        if rn < (playlist.len() as u16 - 30) {
-            break rn;
-        }
-    };
     let mut count = 0;
+    // BUG: Esta logica de chunkeo no funciona, el canal abierto esta dando problemas!
+    // POSIBLEMENTE NO USAR EL CANAL, SINO ENVIAR EL OBJETO CHUNK DIRECRAMENTE A run_cycle
+    // y crear el canal dentro de la misma función. Eso da mucho mas control a la funcion.
     for chunk in &playlist
         .into_iter()
         // .skip(66)
         .chunks(15)
     {
         count += 1;
-        let (sender, receiver) = tokio::sync::mpsc::channel(20000);
         let managers = Managers::new(
             config.judge_score_levenshtein,
             download_path.clone(),
             config.clone(),
         );
-        let sender = Managers::inject_tracks(chunk, sender).await.unwrap();
+        //
+        //     ACA HAY UN PROBLEMA, USAR EL MISMO CANAL PARA AMBAS COSAS PODRIA NO SEWR LO MEJOR
+        //     QUE NUNCA MUERE EL SENDER
+        //
         managers
-            .run_cycle(sender, receiver, connection, redis_client.clone())
+            .run_cycle(chunk, connection, redis_client.clone())
             .await
             .unwrap();
         tracing::info!(cycle_n = count, "\n\nDone with cycle\n\n");

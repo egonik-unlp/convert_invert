@@ -2,7 +2,14 @@ use crate::internals::database::manager::DatabaseManager;
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{
     sync::{
         RwLock, Semaphore,
@@ -159,21 +166,19 @@ impl Managers {
         Ok(sender)
     }
 
-    #[instrument(
-        name = "run-cyle",
-        skip(self, sender, receiver, connection, redis_client)
-    )]
+    #[instrument(name = "run-cyle", skip(self, tracks, connection, redis_client))]
     pub async fn run_cycle(
         self,
-        sender: Sender<Track>,
-        mut receiver: Receiver<Track>,
+        tracks: impl IntoIterator<Item = Track>,
         connection: &mut PgConnection,
         redis_client: redis::Client,
     ) -> anyhow::Result<()> {
         let managers = Arc::new(self);
         let mut database_manager = DatabaseManager::new(connection);
+        let (sender, mut receiver) = mpsc::channel(20000);
 
         managers.client.login().context("Could not connect")?;
+
         let sender = Arc::new(sender);
         let storage = Vec::new();
         let state = Arc::new(RwLock::new(storage));
@@ -181,15 +186,20 @@ impl Managers {
         let search_semaphore = Arc::new(Semaphore::new(4));
         let download_semaphore = Arc::new(Semaphore::new(7));
         let manager_span = info_span!("context-span");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let task_shutdown = Arc::clone(&shutdown);
         let task_manager: JoinHandle<anyhow::Result<()>> = tokio::spawn(
             async move {
-                await_pending_tasks(task_receiver)
+                await_pending_tasks(task_receiver, task_shutdown)
                     .await
                     .context("Awaiting tasks")?;
                 Ok(())
             }
             .instrument(manager_span),
         );
+        for track in tracks {
+            sender.send(track).await.context("injecting tracks")?;
+        }
         loop {
             tokio::select! {
                 maybe_msg = receiver.recv() => {
@@ -315,6 +325,10 @@ impl Managers {
                 _ = tokio::time::sleep(Duration::from_secs(3 * 60)) => {
                     let sender = task_sender.clone();
                     sender.send(QueuePriority::Terminate).await.context("SE ROMPIO EL CHAN CHAN")?;
+                    if shutdown.clone().load(Ordering::SeqCst) {
+                        println!("BREAK LOOOP EL MAS IMPORTANTE");
+                            break;
+                    }
                 }
             }
         }
@@ -328,7 +342,10 @@ impl Managers {
 }
 
 #[instrument(name = "task manager", skip(receiver))]
-pub async fn await_pending_tasks(mut receiver: Receiver<QueuePriority>) -> anyhow::Result<()> {
+pub async fn await_pending_tasks(
+    mut receiver: Receiver<QueuePriority>,
+    shutdown: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     let mut set = JoinSet::new();
     let mut retries_queue = vec![];
     while let Some(msg) = receiver.recv().await {
@@ -351,5 +368,6 @@ pub async fn await_pending_tasks(mut receiver: Receiver<QueuePriority>) -> anyho
         println!("AWAITED ONE");
     }
     println!("\n\n\n\n STOPPED AWAIT PENDING TASKS\n\n\n");
+    shutdown.fetch_not(Ordering::SeqCst);
     Ok(())
 }
