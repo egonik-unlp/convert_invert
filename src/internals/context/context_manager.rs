@@ -133,7 +133,7 @@ impl Managers {
         let lev_judge = Levenshtein::new(score.unwrap_or(0.75));
         let judge_manager = JudgeManager::new(Box::new(lev_judge));
         let query_manager = QueryManager::new(
-            "1B3Q6EB9Pjb57jKywHJPfq?si=2f36139519544813",
+            "4RNxYgx8c1WuDV7MItXel2?si=e5b2ceac9697423f",
             config.client_id,
             config.client_secret,
         );
@@ -317,6 +317,8 @@ impl Managers {
                 }
             }
         }
+        drop(sender);
+        drop(task_sender);
         task_manager
             .await
             .context("Awaiting task manager shutdown")?

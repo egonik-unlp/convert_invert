@@ -64,6 +64,7 @@ impl QueryManager {
                 }
             })
             .collect::<Vec<_>>();
+        println!("Playlist has {} songs", pl.len());
         Ok(pl)
     }
     pub async fn run(&self) -> anyhow::Result<Vec<Track>> {

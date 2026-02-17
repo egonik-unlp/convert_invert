@@ -1,5 +1,3 @@
--- Your SQL goes here
---
 create type reject_reason as ENUM ('already_downloaded','low_score', 'not_music', 'abandoned_attempting_search');
 
 CREATE TABLE IF NOT EXISTS rejected_track (

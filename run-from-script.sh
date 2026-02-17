@@ -2,6 +2,5 @@
 
 docker compose down -v
 docker compose up -d
-diesel database setup
-diesel database reset 
+diesel setup
 cargo run --release

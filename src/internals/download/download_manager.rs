@@ -2,7 +2,7 @@ use crate::internals::{
     context::context_manager::{
         DownloadedFile, RejectReason, RejectedTrack, RetryRequest, Track, send,
     },
-    database::{establish_connection, manager::DatabaseManager, schema::retry_request},
+    database::{establish_connection, manager::DatabaseManager},
     search::search_manager::JudgeSubmission,
 };
 use anyhow::Context;
@@ -104,109 +104,110 @@ async fn download_track(
             let mut redis_con = redis_client.get_connection().unwrap();
             let track_id = DatabaseManager::get_judge_submission_id(connection, &song)
                 .context("Getting js id in download")?;
-            let track = span.in_scope(|| {
-                loop {
-                    if started.elapsed() > hard_deadline {
-                        let retry_request = RetryRequest {
+            let key = format!("dl:{track_id}:progress");
+            let track = loop {
+                if started.elapsed() > hard_deadline {
+                    let retry_request = RetryRequest {
+                        request: song.clone(),
+                        retry_attempts: 0,
+                        failed_download_result: song.query.clone(),
+                    };
+                    break Track::Retry(retry_request);
+                }
+                let status = rec.recv_timeout(Duration::from_secs(60));
+                match status {
+                    Ok(DownloadStatus::Queued) => {
+                        let qs = queued_since.get_or_insert(Instant::now());
+                        if qs.elapsed() > max_queued {
+                            let retry_request = RetryRequest {
+                                request: song.clone(),
+                                failed_download_result: song.clone().query,
+                                retry_attempts: 0,
+                            };
+                            break Track::Retry(retry_request);
+                        }
+                        if last_log.elapsed() > log_every {
+                            tracing::info!("Still queued: {}", song.query.filename);
+                            last_log = Instant::now();
+                        }
+                        continue;
+                    }
+                    Ok(DownloadStatus::InProgress {
+                        bytes_downloaded,
+                        total_bytes,
+                        speed_bytes_per_sec,
+                    }) => {
+                        queued_since = None;
+                        if bytes_downloaded > last_bytes {
+                            last_bytes = bytes_downloaded;
+                            last_progress = Instant::now();
+                        } else if last_progress.elapsed() > max_no_progress {
+                            let retry_request = RetryRequest {
+                                request: song.clone(),
+                                failed_download_result: song.clone().query,
+                                retry_attempts: 0,
+                            };
+                            break Track::Retry(retry_request);
+                        }
+                        if last_log.elapsed() > log_every {
+                            tracing::info!(
+                                "Downloaded {} of {} at {} B/s for {}",
+                                bytes_downloaded,
+                                total_bytes,
+                                speed_bytes_per_sec,
+                                song.query.filename
+                            );
+                            last_log = Instant::now();
+                        }
+
+                        let values = [
+                            (
+                                "bytes_downloaded".to_string(),
+                                format!("{bytes_downloaded}"),
+                            ),
+                            ("total_bytes".to_string(), format!("{total_bytes}")),
+                            (
+                                "speed_bytes_per_sec".to_string(),
+                                format!("{speed_bytes_per_sec}"),
+                            ),
+                        ];
+                        redis_con
+                            .hset_multiple::<String, String, _>(key.clone(), &values)
+                            .unwrap();
+                        // update redis (idealmente también rate-limited)
+                        continue;
+                    }
+                    Ok(DownloadStatus::Completed) => {
+                        redis_con
+                            .hset(key.clone(), "completed".to_string(), format!("{}", true))
+                            .unwrap();
+                        break Track::File(DownloadedFile {
+                            filename: song.query.filename,
+                        });
+                    }
+                    Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) => {
+                        tracing::error!(?song, "Error descargando, se salio del loop");
+                        break Track::Retry(RetryRequest {
                             request: song.clone(),
                             retry_attempts: 0,
-                            failed_download_result: song.query.clone(),
-                        };
-                        return Track::Retry(retry_request);
+                            failed_download_result: song.query,
+                        });
                     }
-                    let status = rec.recv_timeout(Duration::from_secs(60));
-                    match status {
-                        Ok(DownloadStatus::Queued) => {
-                            let qs = queued_since.get_or_insert(Instant::now());
-                            if qs.elapsed() > max_queued {
-                                let retry_request = RetryRequest {
-                                    request: song.clone(),
-                                    failed_download_result: song.clone().query,
-                                    retry_attempts: 0,
-                                };
-                                return Track::Retry(retry_request);
-                            }
-                            if last_log.elapsed() > log_every {
-                                tracing::info!("Still queued: {}", song.query.filename);
-                                last_log = Instant::now();
-                            }
-                            continue;
-                        }
-                        Ok(DownloadStatus::InProgress {
-                            bytes_downloaded,
-                            total_bytes,
-                            speed_bytes_per_sec,
-                        }) => {
-                            queued_since = None;
-                            if bytes_downloaded > last_bytes {
-                                last_bytes = bytes_downloaded;
-                                last_progress = Instant::now();
-                            } else if last_progress.elapsed() > max_no_progress {
-                                let retry_request = RetryRequest {
-                                    request: song.clone(),
-                                    failed_download_result: song.clone().query,
-                                    retry_attempts: 0,
-                                };
-                                return Track::Retry(retry_request);
-                            }
-                            if last_log.elapsed() > log_every {
-                                tracing::info!(
-                                    "Downloaded {} of {} at {} B/s for {}",
-                                    bytes_downloaded,
-                                    total_bytes,
-                                    speed_bytes_per_sec,
-                                    song.query.filename
-                                );
-                                last_log = Instant::now();
-                            }
-
-                            let key = format!("dl:{track_id}:progress");
-                            let values = [
-                                (
-                                    "bytes_downloaded".to_string(),
-                                    format!("{bytes_downloaded}"),
-                                ),
-                                ("total_bytes".to_string(), format!("{total_bytes}")),
-                                (
-                                    "speed_bytes_per_sec".to_string(),
-                                    format!("{speed_bytes_per_sec}"),
-                                ),
-                            ];
-                            redis_con
-                                .hset_multiple::<String, String, _>(key, &values)
-                                .unwrap();
-                            // update redis (idealmente también rate-limited)
-                            continue;
-                        }
-                        Ok(DownloadStatus::Completed) => {
-                            return Track::File(DownloadedFile {
-                                filename: song.query.filename,
-                            });
-                        }
-                        Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) => {
-                            tracing::error!(?song, "Error descargando, se salio del loop");
-                            return Track::Retry(RetryRequest {
+                    Err(retry_or_tout) => {
+                        tracing::error!(?retry_or_tout, "Error downloadning");
+                        // si no recibís eventos, tratá esto como “posible stall”
+                        if last_progress.elapsed() > max_no_progress {
+                            let retry_request = RetryRequest {
                                 request: song.clone(),
+                                failed_download_result: song.clone().query,
                                 retry_attempts: 0,
-                                failed_download_result: song.query,
-                            });
+                            };
+                            break Track::Retry(retry_request);
                         }
-                        Err(retry_or_tout) => {
-                            tracing::error!(?retry_or_tout, "Error downloadning");
-                            // si no recibís eventos, tratá esto como “posible stall”
-                            if last_progress.elapsed() > max_no_progress {
-                                let retry_request = RetryRequest {
-                                    request: song.clone(),
-                                    failed_download_result: song.clone().query,
-                                    retry_attempts: 0,
-                                };
-                                return Track::Retry(retry_request);
-                            }
-                            continue;
-                        }
+                        continue;
                     }
                 }
-            });
+            };
             Ok(track)
         });
     tracing::info!("EXIT OUT OF DOWNLOAD CLOSED LOOP IMPORTANTE IMPORTANTE");

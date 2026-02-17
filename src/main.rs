@@ -1,8 +1,8 @@
-use std::{path::PathBuf, str::FromStr};
-
 use anyhow::Context;
 use diesel_migrations::{MigrationHarness, embed_migrations};
 use itertools::Itertools;
+use rand::Rng;
+use std::{path::PathBuf, str::FromStr};
 use tracing::instrument;
 
 use convert_invert::internals::database::establish_connection;
@@ -33,17 +33,27 @@ async fn main() -> anyhow::Result<()> {
         .context("Tracing")?;
 
     let download_path =
-        PathBuf::from_str("/home/gonik/Music/widerisimoBigChannelWithAsyncDownloadMasRaro")
-            .context("Acquiring download dir")?;
+        PathBuf::from_str("/home/gonik/Music/otra_prueba_g").context("Acquiring download dir")?;
 
     let managers = Managers::new(
         config.judge_score_levenshtein,
         download_path.clone(),
         config.clone(),
     );
+
     let playlist = managers.get_playlist().await;
+    let random_start = loop {
+        let rn = rand::random::<u16>();
+        if rn < (playlist.len() as u16 - 30) {
+            break rn;
+        }
+    };
     let mut count = 0;
-    for chunk in &playlist.into_iter().skip(70).chunks(15) {
+    for chunk in &playlist
+        .into_iter()
+        // .skip(66)
+        .chunks(15)
+    {
         count += 1;
         let (sender, receiver) = tokio::sync::mpsc::channel(20000);
         let managers = Managers::new(

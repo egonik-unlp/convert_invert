@@ -1,2 +1,2 @@
 -- This file should undo anything in `up.sql`
-DROP table downloaded_file
+DROP table downloaded_files

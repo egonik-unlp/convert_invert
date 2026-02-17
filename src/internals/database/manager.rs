@@ -92,7 +92,6 @@ impl<'a> DatabaseManager<'a> {
             .context("Insert judge submission")?;
         Ok(inserted_id)
     }
-    // BUG: ERROR HERE
     pub fn get_judge_submission_id(
         connection: &mut PgConnection,
         judge_submission: &RuntimeJudgeSubmission,
@@ -195,7 +194,6 @@ impl<'a> DatabaseManager<'a> {
                 }
                 Ok(())
             })
-            //BUG: Explodes here
             .context("Persist track into database")?;
         Ok(())
     }
