@@ -2,5 +2,6 @@
 
 docker compose down -v
 docker compose up -d
+sleep 3
 diesel setup
-cargo run --release
+cargo run --release | tee logs-script

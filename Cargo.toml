@@ -42,3 +42,4 @@ diesel = { version = "2.2.0", features = ["postgres"] }
 scopeguard = "1.2.0"
 redis = "1.0.3"
 diesel_migrations = { version = "2.3.1", features = ["postgres"] }
+actix-web = "4.12.1"

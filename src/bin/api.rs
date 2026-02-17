@@ -1,7 +1,10 @@
+use actix_web::{Error, HttpResponse, Responder, get};
 use anyhow::Context;
+use diesel::deserialize::Result;
 use diesel_migrations::{MigrationHarness, embed_migrations};
 use itertools::Itertools;
 use rand::Rng;
+use std::io;
 use std::{path::PathBuf, str::FromStr};
 use tracing::instrument;
 
@@ -15,14 +18,19 @@ use diesel_migrations::EmbeddedMigrations;
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
 #[instrument(name = "main-span")]
-#[tokio::main]
+#[actix_web::main]
 async fn main() -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[get("/launch")]
+async fn launch_playlist_task() -> actix_web::Result<HttpResponse, actix_web::Error> {
     let connection = &mut establish_connection();
     connection
         .run_pending_migrations(MIGRATIONS)
         .expect("CANT RUN MIGS");
     let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
-    let mut config = Config::try_from_env().context("Cannot read env vars for config")?;
+    let mut config = Config::try_from_env().unwrap();
     let attempt_num: usize = match std::env::args().nth(1) {
         Some(value) => value.parse().unwrap(),
         None => 1usize,
@@ -30,10 +38,11 @@ async fn main() -> anyhow::Result<()> {
     config.run_id = format!("{}_attempt_{}", config.run_id, attempt_num);
 
     trace::otel_trace::init_tracing_with_otel("convert-invert".to_string(), config.run_id.clone())
-        .context("Tracing")?;
+        .unwrap();
 
-    let download_path =
-        PathBuf::from_str("/home/gonik/Music/otra_prueba_g").context("Acquiring download dir")?;
+    let download_path = PathBuf::from_str("/home/gonik/Music/otra_prueba_g")
+        .context("Acquiring download dir")
+        .unwrap();
 
     let managers = Managers::new(
         config.judge_score_levenshtein,
@@ -42,12 +51,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let playlist = managers.get_playlist().await;
-    let random_start = loop {
-        let rn = rand::random::<u16>();
-        if rn < (playlist.len() as u16 - 30) {
-            break rn;
-        }
-    };
     let mut count = 0;
     for chunk in &playlist
         .into_iter()
@@ -69,9 +72,6 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!(cycle_n = count, "\n\nDone with cycle\n\n");
         println!("CHUNKERO DUOS {count}")
     }
-
-    println!("Outer");
     trace::otel_trace::shutdown_otel();
-
-    Ok(())
+    Ok(HttpResponse::Ok().body("Done"))
 }

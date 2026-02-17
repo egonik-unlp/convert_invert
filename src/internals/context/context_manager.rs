@@ -114,7 +114,7 @@ impl RunTools {
 pub enum QueuePriority {
     NormalRun(JoinHandle<anyhow::Result<()>>),
     RetryRun(JoinHandle<anyhow::Result<()>>),
-    // Terminate,
+    Terminate,
 }
 
 impl Managers {
@@ -313,16 +313,16 @@ impl Managers {
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_secs(3 * 60)) => {
-                    break;
+                    let sender = task_sender.clone();
+                    sender.send(QueuePriority::Terminate).await.context("SE ROMPIO EL CHAN CHAN")?;
                 }
             }
         }
-        drop(sender);
-        drop(task_sender);
         task_manager
             .await
             .context("Awaiting task manager shutdown")?
             .context("Inner")?;
+        println!("END OF FUNCTION");
         Ok(())
     }
 }
@@ -337,7 +337,7 @@ pub async fn await_pending_tasks(mut receiver: Receiver<QueuePriority>) -> anyho
                 set.spawn(async move { join_handle.await.context("Awaiting handle")? });
             }
             QueuePriority::RetryRun(join_handle) => retries_queue.push(join_handle),
-            // QueuePriority::Terminate => break,
+            QueuePriority::Terminate => break,
         }
     }
 
@@ -348,6 +348,8 @@ pub async fn await_pending_tasks(mut receiver: Receiver<QueuePriority>) -> anyho
     println!("Transition between regular and retries");
     for task in retries_queue {
         task.await.context("Awaiting retry")?.context("inner")?;
+        println!("AWAITED ONE");
     }
+    println!("\n\n\n\n STOPPED AWAIT PENDING TASKS\n\n\n");
     Ok(())
 }

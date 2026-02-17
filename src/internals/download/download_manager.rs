@@ -17,7 +17,7 @@ use tokio::{
 
 fn is_audio_file(filename: String) -> bool {
     let lc = filename.to_lowercase();
-    lc.ends_with(".mp3") || lc.ends_with(".flac") || lc.ends_with(".aiff")
+    lc.ends_with(".mp3") || lc.ends_with(".flac") || lc.ends_with(".aiff") || lc.ends_with(".aac")
 }
 
 pub struct DownloadManager {
@@ -37,11 +37,13 @@ impl DownloadManager {
         track: JudgeSubmission,
         semaphore: Arc<Semaphore>,
         sender: Arc<Sender<Track>>,
-        redis_client: redis::Client,
+        mut redis_client: redis::Client,
     ) -> anyhow::Result<()> {
         let client = Arc::clone(&self.client);
         let download_location = self.root_location.clone();
-        if is_audio_file(track.query.filename.clone()) {
+        let id = format!("{}", track.track.track_id);
+        let is_banned = redis_client.sismember("ban-list", id).unwrap();
+        if is_audio_file(track.query.filename.clone()) && !is_banned {
             let _permit = semaphore.acquire().await.context("acquiring semaphore")?;
             tracing::info!(track.query.filename, "send to download");
             let track = download_track(track, download_location.clone(), client, redis_client)
@@ -93,11 +95,10 @@ async fn download_track(
     let mut last_bytes: u64 = 0;
     let mut last_log = Instant::now();
 
-    let hard_deadline = Duration::from_secs(20 * 60); // 20 min total
-    let max_queued = Duration::from_secs(5 * 60); // 5 min en cola
-    let max_no_progress = Duration::from_secs(90); // 90s sin avanzar
-    let log_every = Duration::from_secs(10); // log cada 10s
-    let span = tracing::info_span!("download_thread_inner");
+    let hard_deadline = Duration::from_secs(3 * 60);
+    let max_queued = Duration::from_secs(60);
+    let max_no_progress = Duration::from_secs(20);
+    let log_every = Duration::from_secs(10);
     let download_handle: JoinHandle<anyhow::Result<Track>> =
         tokio::task::spawn_blocking(move || {
             let connection = &mut establish_connection();
@@ -106,6 +107,8 @@ async fn download_track(
                 .context("Getting js id in download")?;
             let key = format!("dl:{track_id}:progress");
             let track = loop {
+                let id = format!("{}", song.track.track_id);
+                redis_con.sadd("ban-list", id).unwrap();
                 if started.elapsed() > hard_deadline {
                     let retry_request = RetryRequest {
                         request: song.clone(),
@@ -186,6 +189,8 @@ async fn download_track(
                         });
                     }
                     Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) => {
+                        let id = format!("{}", song.track.track_id);
+                        redis_con.sadd("ban-list", id).unwrap();
                         tracing::error!(?song, "Error descargando, se salio del loop");
                         break Track::Retry(RetryRequest {
                             request: song.clone(),
@@ -211,6 +216,7 @@ async fn download_track(
             Ok(track)
         });
     tracing::info!("EXIT OUT OF DOWNLOAD CLOSED LOOP IMPORTANTE IMPORTANTE");
+    println!("EXITTTTTTTTTT");
     let result = download_handle
         .await
         .context("Download thread exiting")?
