@@ -317,12 +317,6 @@ impl Managers {
                 }
             }
         }
-        // task_sender
-        //     .send(QueuePriority::Terminate)
-        //     .await
-        //     .context("sending shutdown signal")?;
-        drop(task_sender);
-        drop(sender);
         task_manager
             .await
             .context("Awaiting task manager shutdown")?

@@ -106,6 +106,14 @@ async fn download_track(
                 .context("Getting js id in download")?;
             let track = span.in_scope(|| {
                 loop {
+                    if started.elapsed() > hard_deadline {
+                        let retry_request = RetryRequest {
+                            request: song.clone(),
+                            retry_attempts: 0,
+                            failed_download_result: song.query.clone(),
+                        };
+                        return Track::Retry(retry_request);
+                    }
                     let status = rec.recv_timeout(Duration::from_secs(60));
                     match status {
                         Ok(DownloadStatus::Queued) => {
@@ -184,6 +192,7 @@ async fn download_track(
                             });
                         }
                         Err(retry_or_tout) => {
+                            tracing::error!(?retry_or_tout, "Error downloadning");
                             // si no recibís eventos, tratá esto como “posible stall”
                             if last_progress.elapsed() > max_no_progress {
                                 let retry_request = RetryRequest {
@@ -200,6 +209,7 @@ async fn download_track(
             });
             Ok(track)
         });
+    tracing::info!("EXIT OUT OF DOWNLOAD CLOSED LOOP IMPORTANTE IMPORTANTE");
     let result = download_handle
         .await
         .context("Download thread exiting")?
