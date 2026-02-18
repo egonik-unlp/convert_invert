@@ -1,7 +1,6 @@
 use anyhow::Context;
 use diesel_migrations::{MigrationHarness, embed_migrations};
 use itertools::Itertools;
-use rand::Rng;
 use std::{path::PathBuf, str::FromStr};
 use tracing::instrument;
 
@@ -43,9 +42,6 @@ async fn main() -> anyhow::Result<()> {
 
     let playlist = managers.get_playlist().await;
     let mut count = 0;
-    // BUG: Esta logica de chunkeo no funciona, el canal abierto esta dando problemas!
-    // POSIBLEMENTE NO USAR EL CANAL, SINO ENVIAR EL OBJETO CHUNK DIRECRAMENTE A run_cycle
-    // y crear el canal dentro de la misma función. Eso da mucho mas control a la funcion.
     for chunk in &playlist
         .into_iter()
         // .skip(66)
@@ -57,10 +53,6 @@ async fn main() -> anyhow::Result<()> {
             download_path.clone(),
             config.clone(),
         );
-        //
-        //     ACA HAY UN PROBLEMA, USAR EL MISMO CANAL PARA AMBAS COSAS PODRIA NO SEWR LO MEJOR
-        //     QUE NUNCA MUERE EL SENDER
-        //
         managers
             .run_cycle(chunk, connection, redis_client.clone())
             .await

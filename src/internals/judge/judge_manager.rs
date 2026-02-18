@@ -21,6 +21,7 @@ pub struct ResponseFormat {
 pub trait Judge: Send + Sync {
     async fn judge(&self, submission: JudgeSubmission) -> anyhow::Result<bool>;
     async fn judge_score(&self, submission: JudgeSubmission) -> anyhow::Result<f32>;
+    async fn judge_block(&self, submissions: Vec<JudgeSubmission>) -> anyhow::Result<Vec<f32>>;
 }
 
 pub struct JudgeManager {

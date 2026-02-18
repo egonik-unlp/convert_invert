@@ -48,7 +48,9 @@ impl QueryManager {
             .unwrap();
         let pl = playlist
             .tracks
-            .items
+            .get_all(&spotify)
+            .await
+            .context("Paginating")?
             .into_iter()
             .flatten()
             .flat_map(|track| {

@@ -35,7 +35,7 @@ opentelemetry = "0.24"
 opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
 opentelemetry-otlp = "0.17"
 opentelemetry-semantic-conventions = "0.31.0"
-rspotify = { version = "0.15.3", features = ["dotenvy"] }
+# rspotify = { version = "0.15.3", features = ["dotenvy"] }
 lazy_static = "1.5.0"
 itertools = "0.14.0"
 diesel = { version = "2.2.0", features = ["postgres"] }

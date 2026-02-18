@@ -57,4 +57,8 @@ impl Judge for LocalLLM {
         let response = self.get_score(submission).await.context("Getting score")?;
         Ok(response.score.unwrap_or_default())
     }
+    #[instrument(name = "LocalLLM::judge_block", skip(self))]
+    async fn judge_block(&self, submissions: Vec<JudgeSubmission>) -> anyhow::Result<Vec<f32>> {
+        todo!()
+    }
 }

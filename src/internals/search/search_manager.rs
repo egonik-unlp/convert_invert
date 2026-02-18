@@ -1,6 +1,5 @@
 use crate::internals::{
     context::context_manager::{Track, send},
-    database::schema,
     parsing::deserialize::Playlist,
 };
 use anyhow::Context;
@@ -15,7 +14,6 @@ use std::{
 };
 use tokio::{
     sync::{Semaphore, mpsc::Sender},
-    task::JoinHandle,
     time::sleep,
 };
 use tracing::{Instrument, info_span, instrument};
