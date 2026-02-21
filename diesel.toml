@@ -6,4 +6,4 @@ file = "src/internals/database/schema.rs"
 custom_type_derives = ["diesel::query_builder::QueryId", "Clone"]
 
 [migrations_directory]
-dir = "/home/gonik/Documents/git/convert-invert/migrations"
+dir = "/home/gonik/Documents/git/convert-invert-site/convert-invert/migrations"

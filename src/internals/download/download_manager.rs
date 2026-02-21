@@ -15,9 +15,88 @@ use tokio::{
     task::JoinHandle,
 };
 
+const HARD_DEADLINE: Duration = Duration::from_secs(3 * 60);
+const MAX_QUEUED: Duration = Duration::from_secs(60);
+const MAX_NO_PROGRESS: Duration = Duration::from_secs(20);
+const LOG_EVERY: Duration = Duration::from_secs(10);
+
 fn is_audio_file(filename: String) -> bool {
     let lc = filename.to_lowercase();
     lc.ends_with(".mp3") || lc.ends_with(".flac") || lc.ends_with(".aiff") || lc.ends_with(".aac")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadDecision {
+    Continue,
+    Retry,
+    Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadEvent {
+    Queued,
+    InProgress { bytes_downloaded: u64 },
+    Completed,
+    Failed,
+    TimedOut,
+    RecvError,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DownloadProgressTracker {
+    started: Duration,
+    queued_since: Option<Duration>,
+    last_progress: Duration,
+    last_bytes: u64,
+}
+
+impl DownloadProgressTracker {
+    fn new(now: Duration) -> Self {
+        Self {
+            started: now,
+            queued_since: None,
+            last_progress: now,
+            last_bytes: 0,
+        }
+    }
+
+    fn on_event(&mut self, now: Duration, event: DownloadEvent) -> DownloadDecision {
+        if now.saturating_sub(self.started) > HARD_DEADLINE {
+            return DownloadDecision::Retry;
+        }
+
+        match event {
+            DownloadEvent::Queued => {
+                let queued_since = self.queued_since.get_or_insert(now);
+                if now.saturating_sub(*queued_since) > MAX_QUEUED {
+                    DownloadDecision::Retry
+                } else {
+                    DownloadDecision::Continue
+                }
+            }
+            DownloadEvent::InProgress { bytes_downloaded } => {
+                self.queued_since = None;
+                if bytes_downloaded > self.last_bytes {
+                    self.last_bytes = bytes_downloaded;
+                    self.last_progress = now;
+                    DownloadDecision::Continue
+                } else if now.saturating_sub(self.last_progress) > MAX_NO_PROGRESS {
+                    DownloadDecision::Retry
+                } else {
+                    DownloadDecision::Continue
+                }
+            }
+            DownloadEvent::Completed => DownloadDecision::Completed,
+            DownloadEvent::Failed | DownloadEvent::TimedOut => DownloadDecision::Retry,
+            DownloadEvent::RecvError => {
+                if now.saturating_sub(self.last_progress) > MAX_NO_PROGRESS {
+                    DownloadDecision::Retry
+                } else {
+                    DownloadDecision::Continue
+                }
+            }
+        }
+    }
 }
 
 pub struct DownloadManager {
@@ -88,17 +167,9 @@ async fn download_track(
         path_str.to_string(),
     )?;
 
-    let started = Instant::now();
-    let mut queued_since: Option<Instant> = None;
-
-    let mut last_progress = Instant::now();
-    let mut last_bytes: u64 = 0;
+    let started_at = Instant::now();
+    let mut tracker = DownloadProgressTracker::new(Duration::ZERO);
     let mut last_log = Instant::now();
-
-    let hard_deadline = Duration::from_secs(3 * 60);
-    let max_queued = Duration::from_secs(60);
-    let max_no_progress = Duration::from_secs(20);
-    let log_every = Duration::from_secs(10);
     let download_handle: JoinHandle<anyhow::Result<Track>> =
         tokio::task::spawn_blocking(move || {
             let connection = &mut establish_connection();
@@ -107,21 +178,11 @@ async fn download_track(
                 .context("Getting js id in download")?;
             let key = format!("dl:{track_id}:progress");
             let track = loop {
-                let id = format!("{}", song.track.track_id);
-                redis_con.sadd("ban-list", id).unwrap();
-                if started.elapsed() > hard_deadline {
-                    let retry_request = RetryRequest {
-                        request: song.clone(),
-                        retry_attempts: 0,
-                        failed_download_result: song.query.clone(),
-                    };
-                    break Track::Retry(retry_request);
-                }
+                let now = started_at.elapsed();
                 let status = rec.recv_timeout(Duration::from_secs(60));
                 match status {
                     Ok(DownloadStatus::Queued) => {
-                        let qs = queued_since.get_or_insert(Instant::now());
-                        if qs.elapsed() > max_queued {
+                        if matches!(tracker.on_event(now, DownloadEvent::Queued), DownloadDecision::Retry) {
                             let retry_request = RetryRequest {
                                 request: song.clone(),
                                 failed_download_result: song.clone().query,
@@ -129,7 +190,7 @@ async fn download_track(
                             };
                             break Track::Retry(retry_request);
                         }
-                        if last_log.elapsed() > log_every {
+                        if last_log.elapsed() > LOG_EVERY {
                             tracing::info!("Still queued: {}", song.query.filename);
                             last_log = Instant::now();
                         }
@@ -140,11 +201,13 @@ async fn download_track(
                         total_bytes,
                         speed_bytes_per_sec,
                     }) => {
-                        queued_since = None;
-                        if bytes_downloaded > last_bytes {
-                            last_bytes = bytes_downloaded;
-                            last_progress = Instant::now();
-                        } else if last_progress.elapsed() > max_no_progress {
+                        if matches!(
+                            tracker.on_event(
+                                now,
+                                DownloadEvent::InProgress { bytes_downloaded },
+                            ),
+                            DownloadDecision::Retry
+                        ) {
                             let retry_request = RetryRequest {
                                 request: song.clone(),
                                 failed_download_result: song.clone().query,
@@ -152,7 +215,7 @@ async fn download_track(
                             };
                             break Track::Retry(retry_request);
                         }
-                        if last_log.elapsed() > log_every {
+                        if last_log.elapsed() > LOG_EVERY {
                             tracing::info!(
                                 "Downloaded {} of {} at {} B/s for {}",
                                 bytes_downloaded,
@@ -181,16 +244,24 @@ async fn download_track(
                         continue;
                     }
                     Ok(DownloadStatus::Completed) => {
-                        redis_con
-                            .hset(key.clone(), "completed".to_string(), format!("{}", true))
-                            .unwrap();
-                        break Track::File(DownloadedFile {
-                            filename: song.query.filename,
-                        });
-                    }
-                    Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) => {
                         let id = format!("{}", song.track.track_id);
                         redis_con.sadd("ban-list", id).unwrap();
+                        if matches!(
+                            tracker.on_event(now, DownloadEvent::Completed),
+                            DownloadDecision::Completed
+                        ) {
+                            redis_con
+                                .hset(key.clone(), "completed".to_string(), format!("{}", true))
+                                .unwrap();
+                            break Track::File(DownloadedFile {
+                                filename: song.query.filename,
+                                track: Some(song.track.clone()),
+                            });
+                        }
+                        continue;
+                    }
+                    Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) => {
+                        let _ = tracker.on_event(now, DownloadEvent::Failed);
                         tracing::error!(?song, "Error descargando, se salio del loop");
                         break Track::Retry(RetryRequest {
                             request: song.clone(),
@@ -201,7 +272,7 @@ async fn download_track(
                     Err(retry_or_tout) => {
                         tracing::error!(?retry_or_tout, "Error downloadning");
                         // si no recibís eventos, tratá esto como “posible stall”
-                        if last_progress.elapsed() > max_no_progress {
+                        if matches!(tracker.on_event(now, DownloadEvent::RecvError), DownloadDecision::Retry) {
                             let retry_request = RetryRequest {
                                 request: song.clone(),
                                 failed_download_result: song.clone().query,
@@ -222,4 +293,75 @@ async fn download_track(
         .context("Download thread exiting")?
         .context("Inner")?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn is_audio_file_accepts_common_formats() {
+        assert!(is_audio_file("song.mp3".to_string()));
+        assert!(is_audio_file("song.FLAC".to_string()));
+        assert!(is_audio_file("song.aiff".to_string()));
+        assert!(is_audio_file("song.AAC".to_string()));
+        assert!(!is_audio_file("song.wav".to_string()));
+        assert!(!is_audio_file("song.txt".to_string()));
+    }
+
+    #[test]
+    fn tracker_retries_on_hard_deadline() {
+        let mut tracker = DownloadProgressTracker::new(Duration::ZERO);
+        let now = HARD_DEADLINE + Duration::from_secs(1);
+        let decision = tracker.on_event(now, DownloadEvent::InProgress { bytes_downloaded: 1 });
+        assert_eq!(decision, DownloadDecision::Retry);
+    }
+
+    #[test]
+    fn tracker_retries_when_queued_too_long() {
+        let mut tracker = DownloadProgressTracker::new(Duration::ZERO);
+        let decision = tracker.on_event(Duration::from_secs(0), DownloadEvent::Queued);
+        assert_eq!(decision, DownloadDecision::Continue);
+
+        let decision = tracker.on_event(MAX_QUEUED + Duration::from_secs(1), DownloadEvent::Queued);
+        assert_eq!(decision, DownloadDecision::Retry);
+    }
+
+    #[test]
+    fn tracker_retries_when_no_progress() {
+        let mut tracker = DownloadProgressTracker::new(Duration::ZERO);
+        let decision = tracker.on_event(Duration::from_secs(1), DownloadEvent::InProgress {
+            bytes_downloaded: 10,
+        });
+        assert_eq!(decision, DownloadDecision::Continue);
+
+        let decision = tracker.on_event(
+            Duration::from_secs(1) + MAX_NO_PROGRESS + Duration::from_secs(1),
+            DownloadEvent::InProgress { bytes_downloaded: 10 },
+        );
+        assert_eq!(decision, DownloadDecision::Retry);
+    }
+
+    #[test]
+    fn tracker_retries_on_recv_error_after_stall() {
+        let mut tracker = DownloadProgressTracker::new(Duration::ZERO);
+        let decision = tracker.on_event(Duration::from_secs(1), DownloadEvent::InProgress {
+            bytes_downloaded: 10,
+        });
+        assert_eq!(decision, DownloadDecision::Continue);
+
+        let decision = tracker.on_event(
+            Duration::from_secs(1) + MAX_NO_PROGRESS + Duration::from_secs(1),
+            DownloadEvent::RecvError,
+        );
+        assert_eq!(decision, DownloadDecision::Retry);
+    }
+
+    #[test]
+    fn tracker_allows_completion() {
+        let mut tracker = DownloadProgressTracker::new(Duration::ZERO);
+        let decision = tracker.on_event(Duration::from_secs(1), DownloadEvent::Completed);
+        assert_eq!(decision, DownloadDecision::Completed);
+    }
 }

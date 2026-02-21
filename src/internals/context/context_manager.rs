@@ -3,7 +3,7 @@ use diesel::prelude::*;
 use redis::Commands;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashSet, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     sync::{
         RwLock, Semaphore,
@@ -24,9 +24,10 @@ use crate::internals::{
     utils::config::config_manager::Config,
 };
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct DownloadedFile {
     pub filename: String,
+    pub track: Option<SearchItem>,
 }
 
 #[derive(Debug)]
@@ -91,7 +92,7 @@ pub struct Managers {
 pub struct RunTools {
     pub download_semaphore: Semaphore,
     pub search_semaphore: Semaphore,
-    pub state: Arc<RwLock<Vec<SearchItem>>>,
+    pub state: Arc<RwLock<DownloadState>>,
     pub sender: Arc<Sender<Track>>,
 }
 
@@ -99,7 +100,7 @@ impl RunTools {
     pub fn new(search_limit: usize, download_limit: usize, sender: Arc<Sender<Track>>) -> Self {
         let search_semaphore = Semaphore::new(search_limit);
         let download_semaphore = Semaphore::new(download_limit);
-        let state = Arc::new(RwLock::new(Vec::new()));
+        let state = Arc::new(RwLock::new(DownloadState::default()));
         Self {
             search_semaphore,
             download_semaphore,
@@ -113,6 +114,15 @@ pub enum QueuePriority {
     NormalRun(JoinHandle<anyhow::Result<()>>),
     RetryRun(JoinHandle<anyhow::Result<()>>),
     Terminate,
+}
+
+const SEARCH_EMPTY_CUTOFF: usize = 3;
+const MAX_RETRY_ATTEMPTS: u8 = 2;
+
+#[derive(Debug, Default)]
+struct DownloadState {
+    in_progress: HashSet<SearchItem>,
+    completed: HashSet<SearchItem>,
 }
 
 impl Managers {
@@ -171,8 +181,7 @@ impl Managers {
         managers.client.login().context("Could not connect")?;
 
         let sender = Arc::new(sender);
-        let storage = Vec::new();
-        let state = Arc::new(RwLock::new(storage));
+        let state = Arc::new(RwLock::new(DownloadState::default()));
         let (task_sender, task_receiver) = mpsc::channel(300);
         let search_semaphore = Arc::new(Semaphore::new(4));
         let download_semaphore = Arc::new(Semaphore::new(7));
@@ -223,7 +232,7 @@ impl Managers {
                                     let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                                         managers
                                             .search_manager
-                                            .run(search_item, 0, semaphore, sender)
+                                            .run(search_item, SEARCH_EMPTY_CUTOFF, semaphore, sender)
                                             .await
                                             .context("returning track")?;
                                         Ok(())
@@ -255,7 +264,7 @@ impl Managers {
                                     let judge_sub = judge_submission.clone();
                                     let sender = Arc::clone(&sender);
                                     let redis_client = redis_client.clone();
-                                    if !state.read().await.contains(&judge_submission.track) {
+                                    if should_start_download(&state, &judge_submission).await {
                                         let redis_client = redis_client.clone();
                                         let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                                             managers
@@ -278,14 +287,14 @@ impl Managers {
                                             .await
                                             .context("sending rejected_tracks")?;
                                     }
-                                    let mut write = state.write().await;
-                                    write.push(judge_submission.track);
                                 }
                                 Track::File(downloaded_file) => {
+                                    mark_download_completed(&state, &downloaded_file).await;
                                     tracing::info!(?downloaded_file, "Downloaded file");
                                 }
                                 Track::Retry(mut retry_request) => {
-                                    if retry_request.retry_attempts >= 1 {
+                                    clear_download_state_on_retry(&state, &retry_request).await;
+                                    if retry_request.retry_attempts >= MAX_RETRY_ATTEMPTS {
                                         let reject = RejectedTrack::new(
                                             retry_request.request,
                                             RejectReason::AbandonedAttemptingSearch,
@@ -304,7 +313,7 @@ impl Managers {
                                     let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                                         managers
                                             .search_manager
-                                            .run(search_item.track, 0, semaphore, sender)
+                                            .run(search_item.track, SEARCH_EMPTY_CUTOFF, semaphore, sender)
                                             .await
                                             .context("returning track")?;
                                         Ok(())
@@ -346,6 +355,37 @@ impl Managers {
     }
 }
 
+async fn should_start_download(
+    state: &RwLock<DownloadState>,
+    judge_submission: &JudgeSubmission,
+) -> bool {
+    let mut write = state.write().await;
+    if write.completed.contains(&judge_submission.track) {
+        return false;
+    }
+    if write.in_progress.contains(&judge_submission.track) {
+        return false;
+    }
+    write.in_progress.insert(judge_submission.track.clone());
+    true
+}
+
+async fn mark_download_completed(state: &RwLock<DownloadState>, downloaded: &DownloadedFile) {
+    let mut write = state.write().await;
+    if let Some(track) = downloaded.track.clone() {
+        write.in_progress.remove(&track);
+        write.completed.insert(track);
+    }
+}
+
+async fn clear_download_state_on_retry(
+    state: &RwLock<DownloadState>,
+    retry_request: &RetryRequest,
+) {
+    let mut write = state.write().await;
+    write.in_progress.remove(&retry_request.request.track);
+}
+
 #[instrument(name = "task manager", skip(receiver))]
 pub async fn await_pending_tasks(
     mut receiver: Receiver<QueuePriority>,
@@ -380,4 +420,66 @@ pub async fn await_pending_tasks(
         .set::<&'static str, bool, ()>("shutdown", true)
         .context("writing to redis")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::internals::search::search_manager::DownloadableFile;
+
+    fn sample_submission() -> JudgeSubmission {
+        JudgeSubmission {
+            track: SearchItem::new("Track".to_string(), "Album".to_string(), "Artist".to_string()),
+            query: DownloadableFile {
+                filename: "track.mp3".to_string(),
+                username: "user".to_string(),
+                size: 123,
+            },
+            score: Some(0.9),
+        }
+    }
+
+    #[tokio::test]
+    async fn should_start_download_marks_state_and_blocks_duplicates() {
+        let state = RwLock::new(DownloadState::default());
+        let submission = sample_submission();
+
+        assert!(should_start_download(&state, &submission).await);
+        assert!(!should_start_download(&state, &submission).await);
+    }
+
+    #[tokio::test]
+    async fn retry_clears_state_for_track() {
+        let state = RwLock::new(DownloadState::default());
+        let submission = sample_submission();
+
+        assert!(should_start_download(&state, &submission).await);
+
+        let retry = RetryRequest {
+            request: submission.clone(),
+            retry_attempts: 0,
+            failed_download_result: submission.query.clone(),
+        };
+        clear_download_state_on_retry(&state, &retry).await;
+
+        assert!(should_start_download(&state, &submission).await);
+    }
+
+    #[tokio::test]
+    async fn mark_download_completed_moves_track_to_completed() {
+        let state = RwLock::new(DownloadState::default());
+        let submission = sample_submission();
+
+        assert!(should_start_download(&state, &submission).await);
+
+        let downloaded = DownloadedFile {
+            filename: submission.query.filename.clone(),
+            track: Some(submission.track.clone()),
+        };
+        mark_download_completed(&state, &downloaded).await;
+
+        let read = state.read().await;
+        assert!(!read.in_progress.contains(&submission.track));
+        assert!(read.completed.contains(&submission.track));
+    }
 }

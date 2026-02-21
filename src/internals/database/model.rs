@@ -176,6 +176,7 @@ impl From<DownloadedFileRow> for DownloadedFile {
     fn from(value: DownloadedFileRow) -> Self {
         Self {
             filename: value.filename,
+            track: None,
         }
     }
 }

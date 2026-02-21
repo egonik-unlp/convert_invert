@@ -57,3 +57,90 @@ impl JudgeManager {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::internals::search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem};
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+
+    #[derive(Debug)]
+    struct FixedJudge {
+        score: f32,
+    }
+
+    #[async_trait]
+    impl Judge for FixedJudge {
+        async fn judge(&self, _submission: JudgeSubmission) -> anyhow::Result<bool> {
+            Ok(self.score > 0.75)
+        }
+
+        async fn judge_score(&self, _submission: JudgeSubmission) -> anyhow::Result<f32> {
+            Ok(self.score)
+        }
+
+        async fn judge_block(&self, submissions: Vec<JudgeSubmission>) -> anyhow::Result<Vec<f32>> {
+            Ok(vec![self.score; submissions.len()])
+        }
+    }
+
+    fn sample_submission() -> JudgeSubmission {
+        JudgeSubmission {
+            track: SearchItem::new("Track".to_string(), "Album".to_string(), "Artist".to_string()),
+            query: DownloadableFile {
+                filename: "track.mp3".to_string(),
+                username: "user".to_string(),
+                size: 123,
+            },
+            score: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn judge_manager_sends_downloadable_on_high_score() {
+        let manager = JudgeManager::new(Box::new(FixedJudge { score: 0.9 }));
+        let (sender, mut receiver) = mpsc::channel(4);
+        let submission = sample_submission();
+
+        manager
+            .run(submission.clone(), Arc::new(sender))
+            .await
+            .unwrap();
+
+        let msg = receiver.recv().await.expect("expected track");
+        match msg {
+            Track::Downloadable(out) => {
+                assert_eq!(out.track, submission.track);
+                assert_eq!(out.query, submission.query);
+                assert_eq!(out.score, Some(0.9));
+            }
+            other => panic!("expected Downloadable, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn judge_manager_sends_reject_on_low_score() {
+        let manager = JudgeManager::new(Box::new(FixedJudge { score: 0.4 }));
+        let (sender, mut receiver) = mpsc::channel(4);
+        let submission = sample_submission();
+
+        manager
+            .run(submission.clone(), Arc::new(sender))
+            .await
+            .unwrap();
+
+        let msg = receiver.recv().await.expect("expected track");
+        match msg {
+            Track::Reject(rejected) => {
+                let (track, reason) = rejected.parts();
+                assert_eq!(track, &submission);
+                match reason {
+                    RejectReason::LowScore(score) => assert!((*score - 0.4).abs() < f32::EPSILON),
+                    _ => panic!("expected LowScore reject reason"),
+                }
+            }
+            other => panic!("expected Reject, got {other:?}"),
+        }
+    }
+}
