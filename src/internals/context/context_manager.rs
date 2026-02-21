@@ -10,6 +10,7 @@ use tokio::{
         mpsc::{self, Receiver, Sender},
     },
     task::{JoinHandle, JoinSet},
+    time::Instant,
 };
 use tracing::{Instrument, info_span, instrument};
 
@@ -90,24 +91,20 @@ pub struct Managers {
 pub struct RunTools {
     pub download_semaphore: Semaphore,
     pub search_semaphore: Semaphore,
-    pub successful_downloads: Vec<Track>,
-    pub rejected_tracks: Vec<Track>,
-    pub handles: Vec<JoinHandle<anyhow::Result<()>>>,
+    pub state: Arc<RwLock<Vec<SearchItem>>>,
+    pub sender: Arc<Sender<Track>>,
 }
 
 impl RunTools {
-    pub fn new(search_limit: usize, download_limit: usize) -> Self {
+    pub fn new(search_limit: usize, download_limit: usize, sender: Arc<Sender<Track>>) -> Self {
         let search_semaphore = Semaphore::new(search_limit);
         let download_semaphore = Semaphore::new(download_limit);
-        let successful_downloads = vec![];
-        let rejected_tracks = vec![];
-        let handles = vec![];
+        let state = Arc::new(RwLock::new(Vec::new()));
         Self {
             search_semaphore,
             download_semaphore,
-            successful_downloads,
-            rejected_tracks,
-            handles,
+            state,
+            sender,
         }
     }
 }
@@ -167,7 +164,6 @@ impl Managers {
         connection: &mut PgConnection,
         mut redis_client: redis::Client,
     ) -> anyhow::Result<()> {
-        println!("Started up new cycle");
         let managers = Arc::new(self);
         let mut database_manager = DatabaseManager::new(connection);
         let (sender, mut receiver) = mpsc::channel(20000);
@@ -180,6 +176,14 @@ impl Managers {
         let (task_sender, task_receiver) = mpsc::channel(300);
         let search_semaphore = Arc::new(Semaphore::new(4));
         let download_semaphore = Arc::new(Semaphore::new(7));
+        let rsender = Arc::clone(&sender);
+        let run_tools = Arc::new(RunTools::new(4, 7, rsender));
+
+        println!(
+            "\n\n\n\nStarted up new cycle\n\n\n\nAvailable Permits:\nSearch semaphore: {}\nDownload semaphore: {}",
+            search_semaphore.available_permits(),
+            download_semaphore.available_permits()
+        );
         let manager_span = info_span!("context-span");
         redis_client.set::<_, _, ()>("shutdown", false).unwrap();
         let spawned_redis = redis_client.clone();
@@ -206,6 +210,7 @@ impl Managers {
                         Some(track) => {
                             tracing::info!(?track, "Incoming package");
                             let task_queue = task_sender.clone();
+
                             database_manager
                                 .load_item_to_database(&track)
                                 .context("Load into database")?;
@@ -363,13 +368,16 @@ pub async fn await_pending_tasks(
             .context("inner")?;
     }
     println!("Transition between regular and retries");
+    println!("Length of await queue = {}", retries_queue.len());
     for task in retries_queue {
+        println!("Started awaiting");
+        let start = Instant::now();
         task.await.context("Awaiting retry")?.context("inner")?;
-        println!("AWAITED ONE");
+        let span = (Instant::now() - start).as_secs_f32();
+        println!("AWAITED ONE. Took {span}s");
     }
-    println!("\n\n\n\n STOPPED AWAIT PENDING TASKS\n\n\n");
     redis_client
         .set::<&'static str, bool, ()>("shutdown", true)
-        .unwrap();
+        .context("writing to redis")?;
     Ok(())
 }

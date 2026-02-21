@@ -38,6 +38,26 @@ impl LocalLLM {
         let response: ResponseFormat = serde_json::from_str(&text).context("parsing response")?;
         Ok(response)
     }
+    #[instrument(name = "LocalLLM::get_score", skip(self, submission))]
+    async fn get_score_vec(
+        &self,
+        submission: Vec<JudgeSubmission>,
+    ) -> anyhow::Result<Vec<ResponseFormat>> {
+        let url = Url::parse(&format!("{}:{}/score", self.address, self.port)).unwrap();
+        let client = reqwest::Client::new();
+        let str_val = serde_json::to_string(&submission).context("Parsing own track")?;
+        let res = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(str_val)
+            .send()
+            .await
+            .context("Response from llm server")?;
+        let text = res.text().await.context("Error reading response")?;
+        let response: Vec<ResponseFormat> =
+            serde_json::from_str(&text).context("parsing response")?;
+        Ok(response)
+    }
 }
 
 #[async_trait]
@@ -59,6 +79,14 @@ impl Judge for LocalLLM {
     }
     #[instrument(name = "LocalLLM::judge_block", skip(self))]
     async fn judge_block(&self, submissions: Vec<JudgeSubmission>) -> anyhow::Result<Vec<f32>> {
-        todo!()
+        let response = self
+            .get_score_vec(submissions)
+            .await
+            .context("Getting score")?;
+        let response: Vec<_> = response
+            .into_iter()
+            .map(|val| val.score.unwrap_or_default())
+            .collect();
+        Ok(response)
     }
 }

@@ -1,5 +1,3 @@
-use std::fmt::format;
-
 use async_trait::async_trait;
 use tracing::instrument;
 
