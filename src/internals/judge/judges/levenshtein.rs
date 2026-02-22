@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use itertools::Itertools;
 use tracing::instrument;
 
 use crate::internals::{judge::judge_manager::Judge, search::search_manager::JudgeSubmission};
@@ -35,8 +36,8 @@ impl Judge for Levenshtein {
         Ok(distance_val as f32)
     }
     #[instrument(name = "Levenshtein::judge_block", skip(self))]
-    async fn judge_block(&self, submissions: Vec<JudgeSubmission>) -> anyhow::Result<Vec<f32>> {
-        let results: Vec<_> = submissions
+    async fn judge_block(&self, submissions: Vec<JudgeSubmission>) -> anyhow::Result<f32> {
+        let result = submissions
             .into_iter()
             .map(|submission| {
                 let distance = str_distance::Levenshtein::default();
@@ -44,7 +45,11 @@ impl Judge for Levenshtein {
                 let b = submission.query.filename;
                 str_distance::str_distance_normalized(a, b, distance) as f32
             })
-            .collect();
-        Ok(results)
+            .sorted_by(|val, other| ((val * 1000.0) as usize).cmp(&((other * 1000.0) as usize)))
+            .rev()
+            .nth(0)
+            .unwrap();
+
+        Ok(result)
     }
 }

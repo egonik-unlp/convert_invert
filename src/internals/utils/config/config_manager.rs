@@ -57,7 +57,6 @@ impl Config {
         })
     }
 
-    //TODO: Find a way
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         log_level: EnvFilter,

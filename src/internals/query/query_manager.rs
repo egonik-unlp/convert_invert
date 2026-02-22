@@ -1,17 +1,8 @@
-//TODO: Remove lint allows
-#![allow(unused, dead_code)]
 use crate::internals::{
-    context::context_manager::{Track, send},
-    parsing::deserialize,
-    search::search_manager::SearchItem,
-    utils::config::config_manager::Config,
+    context::context_manager::Track, parsing::deserialize, search::search_manager::SearchItem,
 };
 use anyhow::Context;
-use itertools::Itertools;
-use rand::Rng;
-use spotify_rs::{ClientCredsClient, ClientCredsFlow, Token, client::Client, model::PlayableItem};
-use std::time::Duration;
-use tokio::{sync::mpsc::Sender, time::sleep};
+use spotify_rs::model::PlayableItem;
 
 #[derive(Debug, Clone)]
 pub struct QueryManager {

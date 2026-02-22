@@ -128,10 +128,23 @@ impl SearchManager {
         sender: Arc<Sender<Track>>,
     ) -> anyhow::Result<()> {
         let client = self.client.clone();
-        let _permit = semaphore.acquire().await.context("Getting permit")?;
+        tracing::info!(
+            available = semaphore.available_permits(),
+            "Waiting for search permit"
+        );
+        let permit = semaphore.acquire().await.context("Getting permit")?;
+        tracing::info!(
+            available = semaphore.available_permits(),
+            "Acquired search permit"
+        );
         track_search_task(client, track, count_cutoff, sender)
             .await
             .context("TST")?;
+        drop(permit);
+        tracing::info!(
+            available = semaphore.available_permits(),
+            "Released search permit"
+        );
         Ok(())
     }
 }
@@ -170,7 +183,7 @@ pub async fn track_search_task(
     let mut count = 0;
     let mut total_files_found = 0;
     'main: loop {
-        sleep(Duration::from_secs(10)).await;
+        sleep(Duration::from_secs(20)).await;
         let results = client.get_search_results(&query_string);
         let results_count: usize = results.iter().map(|res| res.files.len()).sum();
         if !results.is_empty() && !total_files_found.eq(&results_count) {

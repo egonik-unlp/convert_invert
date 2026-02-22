@@ -42,11 +42,7 @@ async fn main() -> anyhow::Result<()> {
 
     let playlist = managers.get_playlist().await;
     let mut count = 0;
-    for chunk in &playlist
-        .into_iter()
-        // .skip(66)
-        .chunks(15)
-    {
+    for chunk in &playlist.into_iter().chunks(15) {
         count += 1;
         let managers = Managers::new(
             config.judge_score_levenshtein,

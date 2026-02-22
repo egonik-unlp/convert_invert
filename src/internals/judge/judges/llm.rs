@@ -1,5 +1,6 @@
 use anyhow::Context;
 use async_trait::async_trait;
+use itertools::Itertools;
 use reqwest::Url;
 use tracing::instrument;
 
@@ -78,15 +79,18 @@ impl Judge for LocalLLM {
         Ok(response.score.unwrap_or_default())
     }
     #[instrument(name = "LocalLLM::judge_block", skip(self))]
-    async fn judge_block(&self, submissions: Vec<JudgeSubmission>) -> anyhow::Result<Vec<f32>> {
+    async fn judge_block(&self, submissions: Vec<JudgeSubmission>) -> anyhow::Result<f32> {
         let response = self
             .get_score_vec(submissions)
             .await
             .context("Getting score")?;
-        let response: Vec<_> = response
+        let response = response
             .into_iter()
             .map(|val| val.score.unwrap_or_default())
-            .collect();
+            .sorted_by(|val, other| ((val * 1000.0) as usize).cmp(&((other * 1000.0) as usize)))
+            .rev()
+            .nth(0)
+            .unwrap();
         Ok(response)
     }
 }

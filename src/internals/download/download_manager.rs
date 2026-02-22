@@ -20,6 +20,9 @@ fn is_audio_file(filename: String) -> bool {
     lc.ends_with(".mp3") || lc.ends_with(".flac") || lc.ends_with(".aiff") || lc.ends_with(".aac")
 }
 
+const MAX_DOWNLOAD_TIMEOUTS: u32 = 3;
+const TIMEOUT_TTL_SECS: i64 = 6 * 60 * 60;
+
 pub struct DownloadManager {
     client: Arc<Client>,
     root_location: PathBuf,
@@ -42,19 +45,59 @@ impl DownloadManager {
         let client = Arc::clone(&self.client);
         let download_location = self.root_location.clone();
         let id = format!("{}", track.track.track_id);
-        let is_banned = redis_client.sismember("ban-list", id).unwrap();
-        if is_audio_file(track.query.filename.clone()) && !is_banned {
-            let _permit = semaphore.acquire().await.context("acquiring semaphore")?;
-            tracing::info!(track.query.filename, "send to download");
-            let track = download_track(track, download_location.clone(), client, redis_client)
-                .await
-                .context("Downloading track")?;
-            send(track, &sender).await.context("Sending to finish")?;
-        } else {
-            let reject = RejectedTrack::new(
-                track.clone(),
-                RejectReason::NotMusic(track.query.filename.clone()),
+        let is_completed = redis_client.sismember("dl:completed", &id).unwrap_or(false);
+        if is_audio_file(track.query.filename.clone()) && !is_completed {
+            let claimed: usize = redis_client.sadd("dl:inflight", &id).unwrap_or(0);
+            if claimed == 0 {
+                let reject = RejectedTrack::new(track.clone(), RejectReason::AlreadyDownloaded);
+                send(Track::Reject(reject), &sender)
+                    .await
+                    .context("Rejection sending to chan")?;
+                tracing::info!(track.query.filename, "Skipped: already downloading");
+                return Ok(());
+            }
+            tracing::info!(
+                available = semaphore.available_permits(),
+                "Waiting for download permit"
             );
+            let permit = semaphore.acquire().await.context("acquiring semaphore")?;
+            tracing::info!(
+                available = semaphore.available_permits(),
+                "Acquired download permit"
+            );
+            tracing::info!(track.query.filename, "send to download");
+            let track = match download_track(
+                track,
+                download_location.clone(),
+                client,
+                redis_client.clone(),
+            )
+            .await
+            {
+                Ok(track) => track,
+                Err(err) => {
+                    let _ = redis_client.srem("dl:inflight", &id);
+                    drop(permit);
+                    tracing::info!(
+                        available = semaphore.available_permits(),
+                        "Released download permit (error)"
+                    );
+                    return Err(err).context("Downloading track");
+                }
+            };
+            send(track, &sender).await.context("Sending to finish")?;
+            drop(permit);
+            tracing::info!(
+                available = semaphore.available_permits(),
+                "Released download permit"
+            );
+        } else {
+            let reason = if is_audio_file(track.query.filename.clone()) {
+                RejectReason::AlreadyDownloaded
+            } else {
+                RejectReason::NotMusic(track.query.filename.clone())
+            };
+            let reject = RejectedTrack::new(track.clone(), reason);
             send(Track::Reject(reject), &sender)
                 .await
                 .context("Rejection sending to chan")?;
@@ -106,28 +149,57 @@ async fn download_track(
             let track_id = DatabaseManager::get_judge_submission_id(connection, &song)
                 .context("Getting js id in download")?;
             let key = format!("dl:{track_id}:progress");
+            let id = format!("{}", song.track.track_id);
+            let timeout_key = format!("dl:{id}:timeouts");
+            let note_timeout = |redis_con: &mut redis::Connection| -> bool {
+                let count: i64 = redis_con
+                    .incr(timeout_key.as_str(), 1)
+                    .unwrap_or(0)
+                    .try_into()
+                    .unwrap_or(i64::MAX);
+                let _ = redis_con.expire(timeout_key.as_str(), TIMEOUT_TTL_SECS);
+                count < i64::from(MAX_DOWNLOAD_TIMEOUTS)
+            };
             let track = loop {
-                let id = format!("{}", song.track.track_id);
-                redis_con.sadd("ban-list", id).unwrap();
                 if started.elapsed() > hard_deadline {
-                    let retry_request = RetryRequest {
-                        request: song.clone(),
-                        retry_attempts: 0,
-                        failed_download_result: song.query.clone(),
-                    };
-                    break Track::Retry(retry_request);
+                    let _ = redis_con.srem("dl:inflight", &id);
+                    if note_timeout(&mut redis_con) {
+                        let retry_request = RetryRequest {
+                            request: song.clone(),
+                            retry_attempts: 0,
+                            failed_download_result: song.query.clone(),
+                        };
+                        break Track::Retry(retry_request);
+                    } else {
+                        tracing::warn!(%id, "Giving up after repeated timeouts");
+                        let reject = RejectedTrack::new(
+                            song.clone(),
+                            RejectReason::AbandonedAttemptingSearch,
+                        );
+                        break Track::Reject(reject);
+                    }
                 }
                 let status = rec.recv_timeout(Duration::from_secs(60));
                 match status {
                     Ok(DownloadStatus::Queued) => {
                         let qs = queued_since.get_or_insert(Instant::now());
                         if qs.elapsed() > max_queued {
-                            let retry_request = RetryRequest {
-                                request: song.clone(),
-                                failed_download_result: song.clone().query,
-                                retry_attempts: 0,
-                            };
-                            break Track::Retry(retry_request);
+                            let _ = redis_con.srem("dl:inflight", &id);
+                            if note_timeout(&mut redis_con) {
+                                let retry_request = RetryRequest {
+                                    request: song.clone(),
+                                    failed_download_result: song.clone().query,
+                                    retry_attempts: 0,
+                                };
+                                break Track::Retry(retry_request);
+                            } else {
+                                tracing::warn!(%id, "Giving up after repeated timeouts");
+                                let reject = RejectedTrack::new(
+                                    song.clone(),
+                                    RejectReason::AbandonedAttemptingSearch,
+                                );
+                                break Track::Reject(reject);
+                            }
                         }
                         if last_log.elapsed() > log_every {
                             tracing::info!("Still queued: {}", song.query.filename);
@@ -145,12 +217,22 @@ async fn download_track(
                             last_bytes = bytes_downloaded;
                             last_progress = Instant::now();
                         } else if last_progress.elapsed() > max_no_progress {
-                            let retry_request = RetryRequest {
-                                request: song.clone(),
-                                failed_download_result: song.clone().query,
-                                retry_attempts: 0,
-                            };
-                            break Track::Retry(retry_request);
+                            let _ = redis_con.srem("dl:inflight", &id);
+                            if note_timeout(&mut redis_con) {
+                                let retry_request = RetryRequest {
+                                    request: song.clone(),
+                                    failed_download_result: song.clone().query,
+                                    retry_attempts: 0,
+                                };
+                                break Track::Retry(retry_request);
+                            } else {
+                                tracing::warn!(%id, "Giving up after repeated timeouts");
+                                let reject = RejectedTrack::new(
+                                    song.clone(),
+                                    RejectReason::AbandonedAttemptingSearch,
+                                );
+                                break Track::Reject(reject);
+                            }
                         }
                         if last_log.elapsed() > log_every {
                             tracing::info!(
@@ -184,30 +266,50 @@ async fn download_track(
                         redis_con
                             .hset(key.clone(), "completed".to_string(), format!("{}", true))
                             .unwrap();
+                        let _ = redis_con.srem("dl:inflight", &id);
+                        let _ = redis_con.sadd("dl:completed", &id);
                         break Track::File(DownloadedFile {
                             filename: song.query.filename,
                         });
                     }
                     Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) => {
-                        let id = format!("{}", song.track.track_id);
-                        redis_con.sadd("ban-list", id).unwrap();
                         tracing::error!(?song, "Error descargando, se salio del loop");
-                        break Track::Retry(RetryRequest {
-                            request: song.clone(),
-                            retry_attempts: 0,
-                            failed_download_result: song.query,
-                        });
+                        let _ = redis_con.srem("dl:inflight", &id);
+                        if note_timeout(&mut redis_con) {
+                            break Track::Retry(RetryRequest {
+                                request: song.clone(),
+                                retry_attempts: 0,
+                                failed_download_result: song.query,
+                            });
+                        } else {
+                            tracing::warn!(%id, "Giving up after repeated timeouts");
+                            let reject = RejectedTrack::new(
+                                song.clone(),
+                                RejectReason::AbandonedAttemptingSearch,
+                            );
+                            break Track::Reject(reject);
+                        }
                     }
                     Err(retry_or_tout) => {
                         tracing::error!(?retry_or_tout, "Error downloadning");
                         // si no recibís eventos, tratá esto como “posible stall”
                         if last_progress.elapsed() > max_no_progress {
-                            let retry_request = RetryRequest {
-                                request: song.clone(),
-                                failed_download_result: song.clone().query,
-                                retry_attempts: 0,
-                            };
-                            break Track::Retry(retry_request);
+                            let _ = redis_con.srem("dl:inflight", &id);
+                            if note_timeout(&mut redis_con) {
+                                let retry_request = RetryRequest {
+                                    request: song.clone(),
+                                    failed_download_result: song.clone().query,
+                                    retry_attempts: 0,
+                                };
+                                break Track::Retry(retry_request);
+                            } else {
+                                tracing::warn!(%id, "Giving up after repeated timeouts");
+                                let reject = RejectedTrack::new(
+                                    song.clone(),
+                                    RejectReason::AbandonedAttemptingSearch,
+                                );
+                                break Track::Reject(reject);
+                            }
                         }
                         continue;
                     }

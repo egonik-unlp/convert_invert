@@ -6,7 +6,7 @@ use soulseek_rs::{Client, ClientSettings};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
     sync::{
-        RwLock, Semaphore,
+        Semaphore,
         mpsc::{self, Receiver, Sender},
     },
     task::{JoinHandle, JoinSet},
@@ -35,6 +35,8 @@ pub struct RetryRequest {
     pub retry_attempts: u8,
     pub failed_download_result: DownloadableFile,
 }
+
+const MAX_RETRY_ATTEMPTS: u8 = 3;
 
 #[derive(Debug)]
 pub enum Track {
@@ -88,27 +90,6 @@ pub struct Managers {
 }
 
 #[derive(Debug)]
-pub struct RunTools {
-    pub download_semaphore: Semaphore,
-    pub search_semaphore: Semaphore,
-    pub state: Arc<RwLock<Vec<SearchItem>>>,
-    pub sender: Arc<Sender<Track>>,
-}
-
-impl RunTools {
-    pub fn new(search_limit: usize, download_limit: usize, sender: Arc<Sender<Track>>) -> Self {
-        let search_semaphore = Semaphore::new(search_limit);
-        let download_semaphore = Semaphore::new(download_limit);
-        let state = Arc::new(RwLock::new(Vec::new()));
-        Self {
-            search_semaphore,
-            download_semaphore,
-            state,
-            sender,
-        }
-    }
-}
-
 pub enum QueuePriority {
     NormalRun(JoinHandle<anyhow::Result<()>>),
     RetryRun(JoinHandle<anyhow::Result<()>>),
@@ -131,7 +112,7 @@ impl Managers {
         let lev_judge = Levenshtein::new(score.unwrap_or(0.75));
         let judge_manager = JudgeManager::new(Box::new(lev_judge));
         let query_manager = QueryManager::new(
-            "4RNxYgx8c1WuDV7MItXel2?si=e5b2ceac9697423f",
+            "7vdaDB7qkKGbE4abs1iFpQ?si=060b186284b14ad2",
             config.client_id,
             config.client_secret,
         );
@@ -171,13 +152,9 @@ impl Managers {
         managers.client.login().context("Could not connect")?;
 
         let sender = Arc::new(sender);
-        let storage = Vec::new();
-        let state = Arc::new(RwLock::new(storage));
         let (task_sender, task_receiver) = mpsc::channel(300);
         let search_semaphore = Arc::new(Semaphore::new(4));
         let download_semaphore = Arc::new(Semaphore::new(7));
-        let rsender = Arc::clone(&sender);
-        let run_tools = Arc::new(RunTools::new(4, 7, rsender));
 
         println!(
             "\n\n\n\nStarted up new cycle\n\n\n\nAvailable Permits:\nSearch semaphore: {}\nDownload semaphore: {}",
@@ -255,37 +232,25 @@ impl Managers {
                                     let judge_sub = judge_submission.clone();
                                     let sender = Arc::clone(&sender);
                                     let redis_client = redis_client.clone();
-                                    if !state.read().await.contains(&judge_submission.track) {
-                                        let redis_client = redis_client.clone();
-                                        let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                                            managers
-                                                .download_manager
-                                                .run(judge_sub, semaphore, sender, redis_client)
-                                                .await
-                                                .context("Downloading")?;
-                                            Ok(())
-                                        });
-                                        task_queue
-                                            .send(QueuePriority::NormalRun(handle))
+                                    let redis_client = redis_client.clone();
+                                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+                                        managers
+                                            .download_manager
+                                            .run(judge_sub, semaphore, sender, redis_client)
                                             .await
-                                            .context("Submitting task to queue")?;
-                                    } else {
-                                        let reject = RejectedTrack::new(
-                                            judge_submission.clone(),
-                                            RejectReason::AlreadyDownloaded,
-                                        );
-                                        send(Track::Reject(reject), &sender)
-                                            .await
-                                            .context("sending rejected_tracks")?;
-                                    }
-                                    let mut write = state.write().await;
-                                    write.push(judge_submission.track);
+                                            .context("Downloading")?;
+                                        Ok(())
+                                    });
+                                    task_queue
+                                        .send(QueuePriority::NormalRun(handle))
+                                        .await
+                                        .context("Submitting task to queue")?;
                                 }
                                 Track::File(downloaded_file) => {
                                     tracing::info!(?downloaded_file, "Downloaded file");
                                 }
                                 Track::Retry(mut retry_request) => {
-                                    if retry_request.retry_attempts >= 1 {
+                                    if retry_request.retry_attempts >= MAX_RETRY_ATTEMPTS {
                                         let reject = RejectedTrack::new(
                                             retry_request.request,
                                             RejectReason::AbandonedAttemptingSearch,
@@ -323,7 +288,7 @@ impl Managers {
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(3 * 60)) => {
+                _ = tokio::time::sleep(Duration::from_secs(15 * 60)) => {
                     let sender = task_sender.clone();
                     sender.send(QueuePriority::Terminate).await.context("SE ROMPIO EL CHAN CHAN")?;
                     let shutdown: bool = redis_client.get::<&'static str, bool>("shutdown").unwrap();
@@ -353,13 +318,32 @@ pub async fn await_pending_tasks(
 ) -> anyhow::Result<()> {
     let mut set = JoinSet::new();
     let mut retries_queue = vec![];
-    while let Some(msg) = receiver.recv().await {
-        match msg {
-            QueuePriority::NormalRun(join_handle) => {
-                set.spawn(async move { join_handle.await.context("Awaiting handle")? });
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    loop {
+        tokio::select! {
+            maybe_msg = receiver.recv() => {
+                match maybe_msg {
+                    None => break,
+                    Some(msg) => match msg {
+                        QueuePriority::NormalRun(join_handle) => {
+                            set.spawn(async move { join_handle.await.context("Awaiting handle")? });
+                        }
+                        QueuePriority::RetryRun(join_handle) => retries_queue.push(join_handle),
+                        QueuePriority::Terminate => break,
+                    },
+                }
             }
-            QueuePriority::RetryRun(join_handle) => retries_queue.push(join_handle),
-            QueuePriority::Terminate => break,
+            _ = interval.tick() => {
+                if let Ok(mut redis_con) = redis_client.get_connection() {
+                    let inflight: usize = redis_con.scard("dl:inflight").unwrap_or(0);
+                    let completed: usize = redis_con.scard("dl:completed").unwrap_or(0);
+                    tracing::info!(
+                        inflight,
+                        completed,
+                        "Download state snapshot"
+                    );
+                }
+            }
         }
     }
 

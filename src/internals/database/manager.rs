@@ -70,6 +70,7 @@ impl<'a> DatabaseManager<'a> {
         .context("update and set score")?;
         Ok(())
     }
+
     fn insert_judge_submission(
         connection: &mut PgConnection,
         judge_submission: &RuntimeJudgeSubmission,
