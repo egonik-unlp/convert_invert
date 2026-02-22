@@ -102,7 +102,12 @@ pub enum QueuePriority {
 }
 
 impl Managers {
-    pub fn new(score: Option<f32>, path: PathBuf, config: Config) -> Self {
+    pub fn new(
+        score: Option<f32>,
+        path: PathBuf,
+        config: Config,
+        playlist_id: impl Into<String>,
+    ) -> Self {
         let client_settings = ClientSettings {
             username: config.user_name,
             password: config.user_password,
@@ -116,11 +121,8 @@ impl Managers {
         let search_manager = SearchManager::new(client.clone());
         let lev_judge = Levenshtein::new(score.unwrap_or(0.75));
         let judge_manager = JudgeManager::new(Box::new(lev_judge));
-        let query_manager = QueryManager::new(
-            "7vdaDB7qkKGbE4abs1iFpQ?si=060b186284b14ad2",
-            config.client_id,
-            config.client_secret,
-        );
+        let query_manager =
+            QueryManager::new(playlist_id, config.client_id, config.client_secret);
         Managers {
             client,
             download_manager,

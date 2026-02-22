@@ -63,11 +63,13 @@ async fn main() -> anyhow::Result<()> {
 
     let download_path =
         PathBuf::from_str("/home/gonik/Music/otra_prueba_g").context("Acquiring download dir")?;
+    let playlist_id = "7vdaDB7qkKGbE4abs1iFpQ?si=060b186284b14ad2";
 
     let managers = Managers::new(
         config.judge_score_levenshtein,
         download_path.clone(),
         config.clone(),
+        playlist_id,
     );
 
     let playlist = apply_playlist_partition(managers.get_playlist().await);
@@ -78,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
             config.judge_score_levenshtein,
             download_path.clone(),
             config.clone(),
+            playlist_id,
         );
         managers
             .run_cycle(chunk, connection, redis_client.clone())
