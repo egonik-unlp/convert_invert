@@ -3,7 +3,12 @@ use diesel::prelude::*;
 use redis::Commands;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     sync::{
         Semaphore,
@@ -156,6 +161,9 @@ impl Managers {
         let search_semaphore = Arc::new(Semaphore::new(4));
         let download_semaphore = Arc::new(Semaphore::new(7));
 
+        let mut download_queue: HashMap<i32, VecDeque<JudgeSubmission>> = HashMap::new();
+        let mut active_downloads: HashMap<i32, String> = HashMap::new();
+
         println!(
             "\n\n\n\nStarted up new cycle\n\n\n\nAvailable Permits:\nSearch semaphore: {}\nDownload semaphore: {}",
             search_semaphore.available_permits(),
@@ -232,24 +240,92 @@ impl Managers {
                                     let judge_sub = judge_submission.clone();
                                     let sender = Arc::clone(&sender);
                                     let redis_client = redis_client.clone();
-                                    let redis_client = redis_client.clone();
-                                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                                        managers
-                                            .download_manager
-                                            .run(judge_sub, semaphore, sender, redis_client)
-                                            .await
-                                            .context("Downloading")?;
-                                        Ok(())
-                                    });
-                                    task_queue
-                                        .send(QueuePriority::NormalRun(handle))
-                                        .await
-                                        .context("Submitting task to queue")?;
+                                    let track_id = judge_submission.track.track_id;
+                                    download_queue
+                                        .entry(track_id)
+                                        .or_default()
+                                        .push_back(judge_submission);
+                                    if !active_downloads.contains_key(&track_id) {
+                                        if let Some(next) = download_queue
+                                            .get_mut(&track_id)
+                                            .and_then(|q| q.pop_front())
+                                        {
+                                            active_downloads.insert(
+                                                track_id,
+                                                next.query.filename.clone(),
+                                            );
+                                            let handle: JoinHandle<anyhow::Result<()>> =
+                                                tokio::spawn(async move {
+                                                    managers
+                                                        .download_manager
+                                                        .run(
+                                                            next,
+                                                            semaphore,
+                                                            sender,
+                                                            redis_client,
+                                                        )
+                                                        .await
+                                                        .context("Downloading")?;
+                                                    Ok(())
+                                                });
+                                            task_queue
+                                                .send(QueuePriority::NormalRun(handle))
+                                                .await
+                                                .context("Submitting task to queue")?;
+                                        }
+                                    }
                                 }
                                 Track::File(downloaded_file) => {
                                     tracing::info!(?downloaded_file, "Downloaded file");
+                                    let finished_track = active_downloads
+                                        .iter()
+                                        .find_map(|(track_id, filename)| {
+                                            if filename == &downloaded_file.filename {
+                                                Some(*track_id)
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                    if let Some(track_id) = finished_track {
+                                        active_downloads.remove(&track_id);
+                                        download_queue.remove(&track_id);
+                                    }
                                 }
                                 Track::Retry(mut retry_request) => {
+                                    let track_id = retry_request.request.track.track_id;
+                                    active_downloads.remove(&track_id);
+                                    if let Some(next) = download_queue
+                                        .get_mut(&track_id)
+                                        .and_then(|q| q.pop_front())
+                                    {
+                                        let managers = Arc::clone(&managers);
+                                        let semaphore = download_semaphore.clone();
+                                        let sender = Arc::clone(&sender);
+                                        let redis_client = redis_client.clone();
+                                        active_downloads.insert(
+                                            track_id,
+                                            next.query.filename.clone(),
+                                        );
+                                        let handle: JoinHandle<anyhow::Result<()>> =
+                                            tokio::spawn(async move {
+                                                managers
+                                                    .download_manager
+                                                    .run(
+                                                        next,
+                                                        semaphore,
+                                                        sender,
+                                                        redis_client,
+                                                    )
+                                                    .await
+                                                    .context("Downloading")?;
+                                                Ok(())
+                                            });
+                                        task_queue
+                                            .send(QueuePriority::NormalRun(handle))
+                                            .await
+                                            .context("Submitting task to queue")?;
+                                        continue;
+                                    }
                                     if retry_request.retry_attempts >= MAX_RETRY_ATTEMPTS {
                                         let reject = RejectedTrack::new(
                                             retry_request.request,
@@ -280,7 +356,43 @@ impl Managers {
                                         .context("Submitting task to queue")?;
                                     tracing::info!(?retry_request, "Retry requestedfile")
                                 }
-                                Track::Reject(_rejected_track) => {}
+                                Track::Reject(rejected_track) => {
+                                    if matches!(rejected_track.parts().1, RejectReason::AbandonedAttemptingSearch) {
+                                        let track_id = rejected_track.parts().0.track.track_id;
+                                        active_downloads.remove(&track_id);
+                                        if let Some(next) = download_queue
+                                            .get_mut(&track_id)
+                                            .and_then(|q| q.pop_front())
+                                        {
+                                            let managers = Arc::clone(&managers);
+                                            let semaphore = download_semaphore.clone();
+                                            let sender = Arc::clone(&sender);
+                                            let redis_client = redis_client.clone();
+                                            active_downloads.insert(
+                                                track_id,
+                                                next.query.filename.clone(),
+                                            );
+                                            let handle: JoinHandle<anyhow::Result<()>> =
+                                                tokio::spawn(async move {
+                                                    managers
+                                                        .download_manager
+                                                        .run(
+                                                            next,
+                                                            semaphore,
+                                                            sender,
+                                                            redis_client,
+                                                        )
+                                                        .await
+                                                        .context("Downloading")?;
+                                                    Ok(())
+                                                });
+                                            task_queue
+                                                .send(QueuePriority::NormalRun(handle))
+                                                .await
+                                                .context("Submitting task to queue")?;
+                                        }
+                                    }
+                                }
                                 Track::NoMoreTracks => {
                                     println!("No more tracks signal received");
                                 }
@@ -288,7 +400,7 @@ impl Managers {
                         }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(15 * 60)) => {
+                _ = tokio::time::sleep(Duration::from_secs(9 * 60)) => {
                     let sender = task_sender.clone();
                     sender.send(QueuePriority::Terminate).await.context("SE ROMPIO EL CHAN CHAN")?;
                     let shutdown: bool = redis_client.get::<&'static str, bool>("shutdown").unwrap();
