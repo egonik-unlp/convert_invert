@@ -63,7 +63,8 @@ async fn main() -> anyhow::Result<()> {
 
     let download_path =
         PathBuf::from_str("/home/gonik/Music/otra_prueba_g").context("Acquiring download dir")?;
-    let playlist_id = "7vdaDB7qkKGbE4abs1iFpQ?si=060b186284b14ad2";
+    let playlist_id = std::env::var("PLAYLIST_ID")
+        .unwrap_or_else(|_| "7vdaDB7qkKGbE4abs1iFpQ?si=060b186284b14ad2".to_string());
 
     let managers = Managers::new(
         config.judge_score_levenshtein,
