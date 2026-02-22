@@ -28,13 +28,15 @@ const INFLIGHT_STALE_SECS: i64 = 7 * 60;
 pub struct DownloadManager {
     client: Arc<Client>,
     root_location: PathBuf,
+    timeout_multiplier: f64,
 }
 
 impl DownloadManager {
-    pub fn new(client: Arc<Client>, root_location: PathBuf) -> Self {
+    pub fn new(client: Arc<Client>, root_location: PathBuf, timeout_multiplier: f64) -> Self {
         DownloadManager {
             client,
             root_location,
+            timeout_multiplier,
         }
     }
     pub async fn run(
@@ -78,6 +80,7 @@ impl DownloadManager {
                 download_location.clone(),
                 client,
                 redis_client.clone(),
+                self.timeout_multiplier,
             )
             .await
             {
@@ -128,6 +131,7 @@ async fn download_track(
     path: PathBuf,
     client: Arc<Client>,
     redis_client: redis::Client,
+    timeout_multiplier: f64,
 ) -> anyhow::Result<Track> {
     let song_path = PathBuf::from_str(&song.query.filename).context("Can't parse filename")?;
     let path = path.join(song_path.file_name().context("Cannot create file")?);
@@ -157,9 +161,14 @@ async fn download_track(
     let mut last_bytes: u64 = 0;
     let mut last_log = Instant::now();
 
-    let hard_deadline = Duration::from_secs(6 * 60);
-    let max_queued = Duration::from_secs(120);
-    let max_no_progress = Duration::from_secs(60);
+    let timeout_multiplier = if timeout_multiplier < 1.0 {
+        1.0
+    } else {
+        timeout_multiplier
+    };
+    let hard_deadline = Duration::from_secs(((6 * 60) as f64 * timeout_multiplier) as u64);
+    let max_queued = Duration::from_secs((120f64 * timeout_multiplier) as u64);
+    let max_no_progress = Duration::from_secs((60f64 * timeout_multiplier) as u64);
     let log_every = Duration::from_secs(10);
     let download_handle: JoinHandle<anyhow::Result<Track>> =
         tokio::task::spawn_blocking(move || {
@@ -199,7 +208,9 @@ async fn download_track(
                         break Track::Reject(reject);
                     }
                 }
-                let status = rec.recv_timeout(Duration::from_secs(120));
+                let status = rec.recv_timeout(Duration::from_secs(
+                    (120f64 * timeout_multiplier) as u64,
+                ));
                 match status {
                     Ok(DownloadStatus::Queued) => {
                         let qs = queued_since.get_or_insert(Instant::now());

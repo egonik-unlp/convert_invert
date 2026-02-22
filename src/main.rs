@@ -1,8 +1,8 @@
 use anyhow::Context;
 use diesel_migrations::{MigrationHarness, embed_migrations};
-use itertools::Itertools;
 use std::{path::PathBuf, str::FromStr};
 use tracing::instrument;
+use redis::Commands;
 
 use convert_invert::internals::database::establish_connection;
 use convert_invert::internals::{
@@ -13,34 +13,10 @@ use convert_invert::internals::{
 use diesel_migrations::EmbeddedMigrations;
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
-fn apply_playlist_partition(mut playlist: Vec<convert_invert::internals::context::context_manager::Track>) -> Vec<convert_invert::internals::context::context_manager::Track> {
-    use std::env;
-
-    let range_start = env::var("PLAYLIST_RANGE_START").ok().and_then(|v| v.parse::<usize>().ok());
-    let range_end = env::var("PLAYLIST_RANGE_END").ok().and_then(|v| v.parse::<usize>().ok());
-    if let (Some(start), Some(end)) = (range_start, range_end) {
-        let len = playlist.len();
-        let start = start.min(len);
-        let end = end.min(len);
-        if start < end {
-            tracing::info!(start, end, len, "Applying explicit playlist range");
-            return playlist.into_iter().skip(start).take(end - start).collect();
-        }
-    }
-
-    let parts = env::var("PLAYLIST_PARTS").ok().and_then(|v| v.parse::<usize>().ok());
-    let index = env::var("PLAYLIST_PART_INDEX").ok().and_then(|v| v.parse::<usize>().ok());
-    if let (Some(parts), Some(index)) = (parts, index) {
-        if parts > 0 && index < parts {
-            let len = playlist.len();
-            let start = len * index / parts;
-            let end = len * (index + 1) / parts;
-            tracing::info!(parts, index, start, end, len, "Applying playlist partition");
-            playlist = playlist.into_iter().skip(start).take(end - start).collect();
-        }
-    }
-
-    playlist
+fn chunk_queue_keys(playlist_id: &str, chunk_size: usize) -> (String, String) {
+    let key = format!("dl:chunk_queue:{playlist_id}:{chunk_size}");
+    let init_key = format!("dl:chunk_queue_init:{playlist_id}:{chunk_size}");
+    (key, init_key)
 }
 
 #[instrument(name = "main-span")]
@@ -75,43 +51,100 @@ async fn main() -> anyhow::Result<()> {
         download_path.clone(),
         config.clone(),
         &playlist_id,
+        1.0,
     );
 
     let full_playlist = managers.get_playlist().await;
-    let playlist = apply_playlist_partition(full_playlist);
-    let playlist_len = playlist.len();
+    let search_items = full_playlist
+        .into_iter()
+        .filter_map(|track| match track {
+            convert_invert::internals::context::context_manager::Track::Query(item) => {
+                Some(item)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    let (queue_key, init_key) = chunk_queue_keys(&playlist_id, chunk_size);
+    {
+        let mut redis_con = redis_client.get_connection().unwrap();
+        let initialized: usize = redis_con.set_nx(init_key.clone(), true).unwrap_or(0);
+        if initialized == 1 {
+            let _: usize = redis_con.del(queue_key.clone()).unwrap_or(0);
+            let len = search_items.len();
+            let mut start = 0usize;
+            while start < len {
+                let end = (start + chunk_size).min(len);
+                let _: usize = redis_con
+                    .rpush(&queue_key, format!("{start}:{end}"))
+                    .unwrap_or(0);
+                start = end;
+            }
+        }
+    }
+
     let mut count = 0;
-    for chunk in &playlist.into_iter().chunks(chunk_size) {
+    loop {
+        let range: Option<String> = {
+            let mut redis_con = redis_client.get_connection().unwrap();
+            redis_con.lpop(&queue_key, None).ok()
+        };
+        let Some(range) = range else { break };
+        let Some((start, end)) = range.split_once(':') else { continue };
+        let start: usize = start.parse().unwrap_or(0);
+        let end: usize = end.parse().unwrap_or(start);
+        let end = end.min(search_items.len());
+        if start >= end {
+            continue;
+        }
+        let chunk = search_items[start..end]
+            .iter()
+            .cloned()
+            .map(convert_invert::internals::context::context_manager::Track::Query)
+            .collect::<Vec<_>>();
         count += 1;
         let managers = Managers::new(
             config.judge_score_levenshtein,
             download_path.clone(),
             config.clone(),
             &playlist_id,
+            1.0,
         );
         managers
             .run_cycle(chunk, connection, redis_client.clone())
             .await
             .unwrap();
         tracing::info!(cycle_n = count, "\n\nDone with cycle\n\n");
-        println!("CHUNKERO DUOS {count}")
+        println!("CHUNKERO DUOS {count}");
     }
-    let managers = Managers::new(
-        config.judge_score_levenshtein,
-        download_path.clone(),
-        config.clone(),
-        &playlist_id,
-    );
-    let remaining = managers.get_playlist().await;
-    if remaining.len() != playlist_len {
-        tracing::info!(
-            remaining = remaining.len().saturating_sub(playlist_len),
-            "Partition complete; attempting remaining tracks"
-        );
-        managers
-            .run_cycle(remaining, connection, redis_client.clone())
-            .await
-            .unwrap();
+
+    let failed_ids: Vec<String> = {
+        let mut redis_con = redis_client.get_connection().unwrap();
+        redis_con.smembers("dl:failed").unwrap_or_default()
+    };
+    if !failed_ids.is_empty() {
+        let failed_items = search_items
+            .into_iter()
+            .filter(|item| failed_ids.contains(&item.track_id.to_string()))
+            .map(convert_invert::internals::context::context_manager::Track::Query)
+            .collect::<Vec<_>>();
+        if !failed_items.is_empty() {
+            tracing::info!(
+                failed = failed_items.len(),
+                "Retrying failed tracks with longer timeouts"
+            );
+            let managers = Managers::new(
+                config.judge_score_levenshtein,
+                download_path.clone(),
+                config.clone(),
+                &playlist_id,
+                2.0,
+            );
+            managers
+                .run_cycle(failed_items, connection, redis_client.clone())
+                .await
+                .unwrap();
+        }
     }
 
     println!("Outer");

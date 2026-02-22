@@ -107,6 +107,7 @@ impl Managers {
         path: PathBuf,
         config: Config,
         playlist_id: impl Into<String>,
+        timeout_multiplier: f64,
     ) -> Self {
         let client_settings = ClientSettings {
             username: config.user_name,
@@ -117,7 +118,7 @@ impl Managers {
         let mut client = Client::with_settings(client_settings);
         client.connect();
         let client = Arc::new(client);
-        let download_manager = DownloadManager::new(client.clone(), path);
+        let download_manager = DownloadManager::new(client.clone(), path, timeout_multiplier);
         let search_manager = SearchManager::new(client.clone());
         let lev_judge = Levenshtein::new(score.unwrap_or(0.75));
         let judge_manager = JudgeManager::new(Box::new(lev_judge));
@@ -183,6 +184,7 @@ impl Managers {
             }
             .instrument(manager_span),
         );
+        let mut task_manager = Some(task_manager);
         for track in tracks {
             sender.send(track).await.context("injecting tracks")?;
         }
@@ -302,6 +304,8 @@ impl Managers {
                                             }
                                         });
                                     if let Some(track_id) = finished_track {
+                                        let _: usize =
+                                            redis_client.srem("dl:failed", &track_id).unwrap_or(0);
                                         active_downloads.remove(&track_id);
                                         download_queue.remove(&track_id);
                                     }
@@ -375,6 +379,8 @@ impl Managers {
                                     if matches!(rejected_track.parts().1, RejectReason::AbandonedAttemptingSearch) {
                                         let track_id = rejected_track.parts().0.track.track_id;
                                         let _: usize =
+                                            redis_client.sadd("dl:failed", &track_id).unwrap_or(0);
+                                        let _: usize =
                                             redis_client.srem("dl:track_claimed", &track_id).unwrap_or(0);
                                         active_downloads.remove(&track_id);
                                         if let Some(next) = download_queue
@@ -420,21 +426,25 @@ impl Managers {
                 _ = tokio::time::sleep(Duration::from_secs(9 * 60)) => {
                     let sender = task_sender.clone();
                     sender.send(QueuePriority::Terminate).await.context("SE ROMPIO EL CHAN CHAN")?;
-                    let shutdown: bool = redis_client.get::<&'static str, bool>("shutdown").unwrap();
-                    println!("Shutdown = {}", shutdown);
-                    if shutdown {
-                        println!("BREAK LOOOP EL MAS IMPORTANTE");
-                            break;
+                    if let Some(handle) = task_manager.take() {
+                        handle
+                            .await
+                            .context("Awaiting task manager shutdown")?
+                            .context("Inner")?;
                     }
+                    println!("BREAK LOOOP EL MAS IMPORTANTE");
+                    break;
                 }
             }
         }
         drop(sender);
         drop(task_sender);
-        task_manager
-            .await
-            .context("Awaiting task manager shutdown")?
-            .context("Inner")?;
+        if let Some(handle) = task_manager {
+            handle
+                .await
+                .context("Awaiting task manager shutdown")?
+                .context("Inner")?;
+        }
         println!("END OF FUNCTION");
         Ok(())
     }
@@ -469,15 +479,36 @@ pub async fn await_pending_tasks(
                     let stale_ids: Vec<String> = redis_con
                         .zrangebyscore("dl:inflight_ts", "-inf", stale_before)
                         .unwrap_or_default();
-                    if !stale_ids.is_empty() {
+                    let inflight_ids: Vec<String> = redis_con.smembers("dl:inflight").unwrap_or_default();
+                    let mut cleanup_ids = stale_ids;
+
+                    if !inflight_ids.is_empty() {
+                        let ts_ids: Vec<String> = redis_con
+                            .zrange("dl:inflight_ts", 0, -1)
+                            .unwrap_or_default();
+                        for id in inflight_ids {
+                            if ts_ids.contains(&id) {
+                                continue;
+                            }
+                            let progress_key = format!("dl:{id}:progress");
+                            let has_progress: bool = redis_con
+                                .hexists(progress_key, "bytes_downloaded")
+                                .unwrap_or(false);
+                            if !has_progress {
+                                cleanup_ids.push(id);
+                            }
+                        }
+                    }
+
+                    if !cleanup_ids.is_empty() {
                         let _: usize =
-                            redis_con.srem("dl:inflight", stale_ids.clone()).unwrap_or(0);
+                            redis_con.srem("dl:inflight", cleanup_ids.clone()).unwrap_or(0);
                         let _: usize =
-                            redis_con.zrem("dl:inflight_ts", stale_ids.clone()).unwrap_or(0);
+                            redis_con.zrem("dl:inflight_ts", cleanup_ids.clone()).unwrap_or(0);
                         let _: usize =
-                            redis_con.srem("dl:track_claimed", stale_ids.clone()).unwrap_or(0);
+                            redis_con.srem("dl:track_claimed", cleanup_ids.clone()).unwrap_or(0);
                         tracing::warn!(
-                            stale = stale_ids.len(),
+                            stale = cleanup_ids.len(),
                             "Cleaned stale inflight entries"
                         );
                     }

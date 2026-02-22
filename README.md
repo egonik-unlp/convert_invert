@@ -76,7 +76,7 @@ curl -X POST http://127.0.0.1:8081/start \
 ```
 
 `GET /status`  
-Returns the list of currently running workers.
+Returns the list of currently running workers plus queue depth and failed count.
 
 `POST /stop`  
 Stops workers. If `pids` is omitted, stops all workers.
@@ -97,3 +97,9 @@ curl -X POST http://127.0.0.1:8081/stop \
 - `WORKER_PORT_BASE` (default `41000`)
 - `WORKER_RUN_ID_PREFIX` (default `web-trigger`)
 - `WORKER_BIN` (optional explicit path to the downloader binary)
+
+### Notes
+
+- The server now runs workers **in-process** (tokio tasks). It **fetches the playlist once**,
+  builds a Redis-backed chunk queue, and workers pop chunks from it.
+- When the queue is empty, failed tracks are retried with longer timeouts.
