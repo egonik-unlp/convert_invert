@@ -129,7 +129,18 @@ async fn download_track(
         song.query.username.clone(),
         song.query.size as u64,
         path_str.to_string(),
-    )?;
+    );
+    let rec = match rec {
+        Ok(rec) => rec,
+        Err(err) => {
+            tracing::error!(?err, "Failed to start download");
+            return Ok(Track::Retry(RetryRequest {
+                request: song.clone(),
+                retry_attempts: 0,
+                failed_download_result: song.query.clone(),
+            }));
+        }
+    };
 
     let started = Instant::now();
     let mut queued_since: Option<Instant> = None;
@@ -138,9 +149,9 @@ async fn download_track(
     let mut last_bytes: u64 = 0;
     let mut last_log = Instant::now();
 
-    let hard_deadline = Duration::from_secs(3 * 60);
-    let max_queued = Duration::from_secs(60);
-    let max_no_progress = Duration::from_secs(20);
+    let hard_deadline = Duration::from_secs(6 * 60);
+    let max_queued = Duration::from_secs(120);
+    let max_no_progress = Duration::from_secs(60);
     let log_every = Duration::from_secs(10);
     let download_handle: JoinHandle<anyhow::Result<Track>> =
         tokio::task::spawn_blocking(move || {
@@ -179,7 +190,7 @@ async fn download_track(
                         break Track::Reject(reject);
                     }
                 }
-                let status = rec.recv_timeout(Duration::from_secs(60));
+                let status = rec.recv_timeout(Duration::from_secs(120));
                 match status {
                     Ok(DownloadStatus::Queued) => {
                         let qs = queued_since.get_or_insert(Instant::now());
