@@ -40,6 +40,7 @@ struct StartRequest {
     port_base: Option<u16>,
     run_id_prefix: Option<String>,
     playlist_id: Option<String>,
+    chunk_size: Option<usize>,
     playlist_range_start: Option<usize>,
     playlist_range_end: Option<usize>,
 }
@@ -57,6 +58,7 @@ async fn start_workers(state: web::Data<AppState>, req: web::Json<StartRequest>)
         .clone()
         .unwrap_or_else(|| state.config.run_id_prefix.clone());
     let playlist_id = req.playlist_id.clone();
+    let chunk_size = req.chunk_size;
     let range_start = req.playlist_range_start;
     let range_end = req.playlist_range_end;
     let mut spawned: Vec<WorkerInfo> = Vec::with_capacity(count);
@@ -83,6 +85,9 @@ async fn start_workers(state: web::Data<AppState>, req: web::Json<StartRequest>)
             .stderr(Stdio::inherit());
         if let Some(id) = playlist_id.as_ref() {
             cmd.env("PLAYLIST_ID", id);
+        }
+        if let Some(size) = chunk_size {
+            cmd.env("CHUNK_SIZE", size.to_string());
         }
         if let (Some(start), Some(end)) = (range_start, range_end) {
             if start >= end {

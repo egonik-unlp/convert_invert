@@ -203,6 +203,19 @@ impl Managers {
                                 .context("Load into database")?;
                             match track {
                                 Track::Query(search_item) => {
+                                    let track_id = format!("{}", search_item.track_id);
+                                    let is_completed =
+                                        redis_client.sismember("dl:completed", &track_id).unwrap_or(false);
+                                    if is_completed {
+                                        tracing::info!(%track_id, "Skipping search: already completed");
+                                        continue;
+                                    }
+                                    let claimed: usize =
+                                        redis_client.sadd("dl:track_claimed", &track_id).unwrap_or(0);
+                                    if claimed == 0 {
+                                        tracing::info!(%track_id, "Skipping search: already claimed");
+                                        continue;
+                                    }
                                     let managers = Arc::clone(&managers);
                                     let sender = Arc::clone(&sender);
                                     let semaphore = search_semaphore.clone();
@@ -361,6 +374,8 @@ impl Managers {
                                 Track::Reject(rejected_track) => {
                                     if matches!(rejected_track.parts().1, RejectReason::AbandonedAttemptingSearch) {
                                         let track_id = rejected_track.parts().0.track.track_id;
+                                        let _: usize =
+                                            redis_client.srem("dl:track_claimed", &track_id).unwrap_or(0);
                                         active_downloads.remove(&track_id);
                                         if let Some(next) = download_queue
                                             .get_mut(&track_id)
@@ -449,6 +464,23 @@ pub async fn await_pending_tasks(
             }
             _ = interval.tick() => {
                 if let Ok(mut redis_con) = redis_client.get_connection() {
+                    let now = chrono::Utc::now().timestamp();
+                    let stale_before = now - 7 * 60;
+                    let stale_ids: Vec<String> = redis_con
+                        .zrangebyscore("dl:inflight_ts", "-inf", stale_before)
+                        .unwrap_or_default();
+                    if !stale_ids.is_empty() {
+                        let _: usize =
+                            redis_con.srem("dl:inflight", stale_ids.clone()).unwrap_or(0);
+                        let _: usize =
+                            redis_con.zrem("dl:inflight_ts", stale_ids.clone()).unwrap_or(0);
+                        let _: usize =
+                            redis_con.srem("dl:track_claimed", stale_ids.clone()).unwrap_or(0);
+                        tracing::warn!(
+                            stale = stale_ids.len(),
+                            "Cleaned stale inflight entries"
+                        );
+                    }
                     let inflight: usize = redis_con.scard("dl:inflight").unwrap_or(0);
                     let completed: usize = redis_con.scard("dl:completed").unwrap_or(0);
                     tracing::info!(

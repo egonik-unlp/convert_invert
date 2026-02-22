@@ -65,23 +65,29 @@ async fn main() -> anyhow::Result<()> {
         PathBuf::from_str("/home/gonik/Music/otra_prueba_g").context("Acquiring download dir")?;
     let playlist_id = std::env::var("PLAYLIST_ID")
         .unwrap_or_else(|_| "7vdaDB7qkKGbE4abs1iFpQ?si=060b186284b14ad2".to_string());
+    let chunk_size: usize = std::env::var("CHUNK_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
 
     let managers = Managers::new(
         config.judge_score_levenshtein,
         download_path.clone(),
         config.clone(),
-        playlist_id,
+        &playlist_id,
     );
 
-    let playlist = apply_playlist_partition(managers.get_playlist().await);
+    let full_playlist = managers.get_playlist().await;
+    let playlist = apply_playlist_partition(full_playlist);
+    let playlist_len = playlist.len();
     let mut count = 0;
-    for chunk in &playlist.into_iter().chunks(15) {
+    for chunk in &playlist.into_iter().chunks(chunk_size) {
         count += 1;
         let managers = Managers::new(
             config.judge_score_levenshtein,
             download_path.clone(),
             config.clone(),
-            playlist_id,
+            &playlist_id,
         );
         managers
             .run_cycle(chunk, connection, redis_client.clone())
@@ -89,6 +95,23 @@ async fn main() -> anyhow::Result<()> {
             .unwrap();
         tracing::info!(cycle_n = count, "\n\nDone with cycle\n\n");
         println!("CHUNKERO DUOS {count}")
+    }
+    let managers = Managers::new(
+        config.judge_score_levenshtein,
+        download_path.clone(),
+        config.clone(),
+        &playlist_id,
+    );
+    let remaining = managers.get_playlist().await;
+    if remaining.len() != playlist_len {
+        tracing::info!(
+            remaining = remaining.len().saturating_sub(playlist_len),
+            "Partition complete; attempting remaining tracks"
+        );
+        managers
+            .run_cycle(remaining, connection, redis_client.clone())
+            .await
+            .unwrap();
     }
 
     println!("Outer");
