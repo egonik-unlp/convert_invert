@@ -1,9 +1,13 @@
-use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
+use convert_invert::internals::database::establish_connection;
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 
 #[derive(Clone)]
 struct AppConfig {
@@ -15,7 +19,7 @@ struct AppConfig {
     run_id_prefix: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct WorkerInfo {
     index: usize,
     username: String,
@@ -35,17 +39,12 @@ struct StartRequest {
     username_prefix: Option<String>,
     port_base: Option<u16>,
     run_id_prefix: Option<String>,
-    playlist_parts: Option<usize>,
-    playlist_part_offset: Option<usize>,
     playlist_range_start: Option<usize>,
     playlist_range_end: Option<usize>,
 }
 
 #[post("/start")]
-async fn start_workers(
-    state: web::Data<AppState>,
-    req: web::Json<StartRequest>,
-) -> impl Responder {
+async fn start_workers(state: web::Data<AppState>, req: web::Json<StartRequest>) -> impl Responder {
     let count = req.worker_count.unwrap_or(state.config.worker_count);
     let username_prefix = req
         .username_prefix
@@ -56,8 +55,6 @@ async fn start_workers(
         .run_id_prefix
         .clone()
         .unwrap_or_else(|| state.config.run_id_prefix.clone());
-    let playlist_parts = req.playlist_parts.unwrap_or(count);
-    let playlist_part_offset = req.playlist_part_offset.unwrap_or(0);
     let range_start = req.playlist_range_start;
     let range_end = req.playlist_range_end;
     let mut spawned: Vec<WorkerInfo> = Vec::with_capacity(count);
@@ -67,7 +64,6 @@ async fn start_workers(
         let username = format!("{}{}", username_prefix, i + 1);
         let port = port_base.saturating_add(i as u16);
         let run_id = format!("{}-{}", run_id_prefix, i + 1);
-        let part_index = playlist_part_offset.saturating_add(i);
 
         let started_at_epoch_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -78,14 +74,21 @@ async fn start_workers(
         cmd.env("USER_NAME", &username)
             .env("LISTEN_PORT", port.to_string())
             .env("RUN_ID", &run_id)
-            .env("PLAYLIST_PARTS", playlist_parts.to_string())
-            .env("PLAYLIST_PART_INDEX", part_index.to_string())
+            .env("PLAYLIST_PARTS", count.to_string())
+            .env("PLAYLIST_PART_INDEX", i.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
         if let (Some(start), Some(end)) = (range_start, range_end) {
-            cmd.env("PLAYLIST_RANGE_START", start.to_string())
-                .env("PLAYLIST_RANGE_END", end.to_string());
+            if start >= end {
+                return HttpResponse::BadRequest()
+                    .body("playlist_range_start must be < playlist_range_end");
+            }
+            let span = end - start;
+            let sub_start = start + (span * i) / count;
+            let sub_end = start + (span * (i + 1)) / count;
+            cmd.env("PLAYLIST_RANGE_START", sub_start.to_string())
+                .env("PLAYLIST_RANGE_END", sub_end.to_string());
         }
 
         let child = match cmd.spawn() {
@@ -176,7 +179,10 @@ fn resolve_worker_bin() -> anyhow::Result<PathBuf> {
     }
 
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let candidate = Path::new(manifest_dir).join("target").join("debug").join("convert-invert");
+    let candidate = Path::new(manifest_dir)
+        .join("target")
+        .join("debug")
+        .join("convert-invert");
     if candidate.is_file() {
         return Ok(candidate);
     }
@@ -190,14 +196,14 @@ fn load_config() -> anyhow::Result<AppConfig> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(4);
-    let username_prefix = std::env::var("WORKER_USERNAME_PREFIX")
-        .unwrap_or_else(|_| "worker".to_string());
+    let username_prefix =
+        std::env::var("WORKER_USERNAME_PREFIX").unwrap_or_else(|_| "worker".to_string());
     let port_base = std::env::var("WORKER_PORT_BASE")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(41000);
-    let run_id_prefix = std::env::var("WORKER_RUN_ID_PREFIX")
-        .unwrap_or_else(|_| "web-trigger".to_string());
+    let run_id_prefix =
+        std::env::var("WORKER_RUN_ID_PREFIX").unwrap_or_else(|_| "web-trigger".to_string());
 
     let worker_bin = resolve_worker_bin()?;
     Ok(AppConfig {
@@ -218,6 +224,10 @@ async fn main() -> anyhow::Result<()> {
         config: config.clone(),
     });
 
+    let connection = &mut establish_connection();
+    connection
+        .run_pending_migrations(MIGRATIONS)
+        .expect("CANT RUN MIGS");
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
