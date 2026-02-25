@@ -1,4 +1,4 @@
-use actix_web::{get, post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use convert_invert::internals::{
     context::context_manager::{Managers, Track},
     database::establish_connection,
@@ -6,7 +6,7 @@ use convert_invert::internals::{
     search::search_manager::SearchItem,
     utils::config::config_manager::Config,
 };
-use diesel_migrations::{embed_migrations, EmbeddedMigrations, MigrationHarness};
+use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use redis::Commands;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -117,7 +117,6 @@ async fn run_worker(
             worker_config.judge_score_levenshtein,
             download_path.clone(),
             worker_config.clone(),
-            playlist_id.clone(),
             1.0,
         );
         let connection = &mut establish_connection();
@@ -145,7 +144,6 @@ async fn run_worker(
                     worker_config.judge_score_levenshtein,
                     download_path.clone(),
                     worker_config.clone(),
-                    playlist_id.clone(),
                     2.0,
                 );
                 let connection = &mut establish_connection();
@@ -197,7 +195,11 @@ async fn start_workers(state: web::Data<AppState>, req: web::Json<StartRequest>)
         let start = start.min(playlist_tracks.len());
         let end = end.min(playlist_tracks.len());
         if start < end {
-            playlist_tracks = playlist_tracks.into_iter().skip(start).take(end - start).collect();
+            playlist_tracks = playlist_tracks
+                .into_iter()
+                .skip(start)
+                .take(end - start)
+                .collect();
         }
     }
 

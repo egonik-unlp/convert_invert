@@ -14,7 +14,6 @@ use tokio::{
     sync::{Semaphore, mpsc::Sender},
     task::JoinHandle,
 };
-use chrono::Utc;
 
 fn is_audio_file(filename: String) -> bool {
     let lc = filename.to_lowercase();
@@ -23,7 +22,6 @@ fn is_audio_file(filename: String) -> bool {
 
 const MAX_DOWNLOAD_TIMEOUTS: u32 = 3;
 const TIMEOUT_TTL_SECS: i64 = 6 * 60 * 60;
-const INFLIGHT_STALE_SECS: i64 = 7 * 60;
 
 pub struct DownloadManager {
     client: Arc<Client>,
@@ -60,11 +58,6 @@ impl DownloadManager {
                 tracing::info!(track.query.filename, "Skipped: already downloading");
                 return Ok(());
             }
-            let now = Utc::now().timestamp();
-            let _: usize = redis_client.zadd("dl:inflight_ts", &id, now).unwrap_or(0);
-            let _: bool = redis_client
-                .expire("dl:inflight_ts", INFLIGHT_STALE_SECS)
-                .unwrap_or(false);
             tracing::info!(
                 available = semaphore.available_permits(),
                 "Waiting for download permit"
@@ -87,7 +80,6 @@ impl DownloadManager {
                 Ok(track) => track,
                 Err(err) => {
                     let _ = redis_client.srem("dl:inflight", &id);
-                    let _ = redis_client.zrem("dl:inflight_ts", &id);
                     drop(permit);
                     tracing::info!(
                         available = semaphore.available_permits(),
@@ -141,18 +133,7 @@ async fn download_track(
         song.query.username.clone(),
         song.query.size as u64,
         path_str.to_string(),
-    );
-    let rec = match rec {
-        Ok(rec) => rec,
-        Err(err) => {
-            tracing::error!(?err, "Failed to start download");
-            return Ok(Track::Retry(RetryRequest {
-                request: song.clone(),
-                retry_attempts: 0,
-                failed_download_result: song.query.clone(),
-            }));
-        }
-    };
+    )?;
 
     let started = Instant::now();
     let mut queued_since: Option<Instant> = None;
@@ -161,14 +142,9 @@ async fn download_track(
     let mut last_bytes: u64 = 0;
     let mut last_log = Instant::now();
 
-    let timeout_multiplier = if timeout_multiplier < 1.0 {
-        1.0
-    } else {
-        timeout_multiplier
-    };
-    let hard_deadline = Duration::from_secs(((6 * 60) as f64 * timeout_multiplier) as u64);
-    let max_queued = Duration::from_secs((120f64 * timeout_multiplier) as u64);
-    let max_no_progress = Duration::from_secs((60f64 * timeout_multiplier) as u64);
+    let hard_deadline = Duration::from_secs(3 * 60);
+    let max_queued = Duration::from_secs(60);
+    let max_no_progress = Duration::from_secs(20);
     let log_every = Duration::from_secs(10);
     let download_handle: JoinHandle<anyhow::Result<Track>> =
         tokio::task::spawn_blocking(move || {
@@ -191,7 +167,6 @@ async fn download_track(
             let track = loop {
                 if started.elapsed() > hard_deadline {
                     let _ = redis_con.srem("dl:inflight", &id);
-                    let _ = redis_con.zrem("dl:inflight_ts", &id);
                     if note_timeout(&mut redis_con) {
                         let retry_request = RetryRequest {
                             request: song.clone(),
@@ -208,15 +183,12 @@ async fn download_track(
                         break Track::Reject(reject);
                     }
                 }
-                let status = rec.recv_timeout(Duration::from_secs(
-                    (120f64 * timeout_multiplier) as u64,
-                ));
+                let status = rec.recv_timeout(Duration::from_secs(60));
                 match status {
                     Ok(DownloadStatus::Queued) => {
                         let qs = queued_since.get_or_insert(Instant::now());
                         if qs.elapsed() > max_queued {
                             let _ = redis_con.srem("dl:inflight", &id);
-                            let _ = redis_con.zrem("dl:inflight_ts", &id);
                             if note_timeout(&mut redis_con) {
                                 let retry_request = RetryRequest {
                                     request: song.clone(),
@@ -299,7 +271,6 @@ async fn download_track(
                             .hset(key.clone(), "completed".to_string(), format!("{}", true))
                             .unwrap();
                         let _ = redis_con.srem("dl:inflight", &id);
-                        let _ = redis_con.zrem("dl:inflight_ts", &id);
                         let _ = redis_con.sadd("dl:completed", &id);
                         break Track::File(DownloadedFile {
                             filename: song.query.filename,
@@ -308,7 +279,6 @@ async fn download_track(
                     Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) => {
                         tracing::error!(?song, "Error descargando, se salio del loop");
                         let _ = redis_con.srem("dl:inflight", &id);
-                        let _ = redis_con.zrem("dl:inflight_ts", &id);
                         if note_timeout(&mut redis_con) {
                             break Track::Retry(RetryRequest {
                                 request: song.clone(),
@@ -329,7 +299,6 @@ async fn download_track(
                         // si no recibís eventos, tratá esto como “posible stall”
                         if last_progress.elapsed() > max_no_progress {
                             let _ = redis_con.srem("dl:inflight", &id);
-                            let _ = redis_con.zrem("dl:inflight_ts", &id);
                             if note_timeout(&mut redis_con) {
                                 let retry_request = RetryRequest {
                                     request: song.clone(),
