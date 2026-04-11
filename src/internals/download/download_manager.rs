@@ -2,7 +2,7 @@ use crate::internals::{
     context::context_manager::{
         DownloadedFile, RejectReason, RejectedTrack, RetryRequest, Track, send,
     },
-    database::{establish_connection, manager::DatabaseManager},
+    database::manager::DatabaseManager,
     search::search_manager::JudgeSubmission,
 };
 use anyhow::Context;

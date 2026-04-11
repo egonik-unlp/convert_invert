@@ -1,5 +1,4 @@
 use crate::internals::database::manager::DatabaseManager;
-use diesel::prelude::*;
 use redis::Commands;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
@@ -78,7 +77,7 @@ pub async fn send(message: Track, chan: &Sender<Track>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub type RedisPool = redis::r2d2::Pool<redis::Client>;
+pub type RedisPool = r2d2::Pool<redis::Client>;
 
 pub struct Managers {
     pub client: Arc<Client>,

@@ -151,13 +151,13 @@ impl<'a> DatabaseManager<'a> {
             .context("Insert rejected track")?;
         Ok(())
     }
-    fn get_search_item_id(
+    pub fn get_search_item_id(
         connection: &mut PgConnection,
         search_item: &RuntimeSearchItem,
     ) -> anyhow::Result<i32> {
         use schema::search_items::dsl as sl;
         let search_id = schema::search_items::table
-            .filter(sl::track_id.eq(search_item.track_id))
+            .filter(sl::track_id.eq(search_item.track_id as i64))
             .select(schema::search_items::id)
             .get_result(connection)
             .context("database fetch search_id in get seatch id func")?;
