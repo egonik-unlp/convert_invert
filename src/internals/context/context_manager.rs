@@ -77,7 +77,7 @@ pub async fn send(message: Track, chan: &Sender<Track>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub type RedisPool = r2d2::Pool<redis::Client>;
+pub type RedisPool = diesel::r2d2::Pool<redis::Client>;
 
 pub struct Managers {
     pub client: Arc<Client>,
