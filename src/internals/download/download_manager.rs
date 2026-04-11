@@ -37,16 +37,20 @@ impl DownloadManager {
         track: JudgeSubmission,
         semaphore: Arc<Semaphore>,
         sender: Arc<Sender<Track>>,
-        mut redis_client: redis::Client,
+        redis_pool: crate::internals::context::context_manager::RedisPool,
+        db_pool: crate::internals::database::DbPool,
     ) -> anyhow::Result<()> {
         let client = Arc::clone(&self.client);
         let download_location = self.root_location.clone();
         let id = format!("{}", track.track.track_id);
-        let is_banned = redis_client.sismember("ban-list", id).unwrap();
+        let is_banned = {
+            let mut redis_con = redis_pool.get().context("Redis pool in run")?;
+            redis_con.sismember::<_, _, bool>("ban-list", id).unwrap_or(false)
+        };
         if is_audio_file(track.query.filename.clone()) && !is_banned {
             let _permit = semaphore.acquire().await.context("acquiring semaphore")?;
             tracing::info!(track.query.filename, "send to download");
-            let track = download_track(track, download_location.clone(), client, redis_client)
+            let track = download_track(track, download_location.clone(), client, redis_pool, db_pool)
                 .await
                 .context("Downloading track")?;
             send(track, &sender).await.context("Sending to finish")?;
@@ -67,7 +71,7 @@ impl DownloadManager {
     }
 }
 
-#[tracing::instrument(name = "DownloadManager::download_track", skip(song, path, client ), fields(
+#[tracing::instrument(name = "DownloadManager::download_track", skip(song, path, client, redis_pool, db_pool ), fields(
     id = song.track.track_id,
     song_name = song.query.filename,
     user_name = song.query.username,
@@ -76,7 +80,8 @@ async fn download_track(
     song: JudgeSubmission,
     path: PathBuf,
     client: Arc<Client>,
-    redis_client: redis::Client,
+    redis_pool: crate::internals::context::context_manager::RedisPool,
+    db_pool: crate::internals::database::DbPool,
 ) -> anyhow::Result<Track> {
     let song_path = PathBuf::from_str(&song.query.filename).context("Can't parse filename")?;
     let path = path.join(song_path.file_name().context("Cannot create file")?);
@@ -101,9 +106,9 @@ async fn download_track(
     let log_every = Duration::from_secs(10);
     let download_handle: JoinHandle<anyhow::Result<Track>> =
         tokio::task::spawn_blocking(move || {
-            let connection = &mut establish_connection();
-            let mut redis_con = redis_client.get_connection().unwrap();
-            let track_id = DatabaseManager::get_judge_submission_id(connection, &song)
+            let mut conn = db_pool.get().context("DB pool in download_track")?;
+            let mut redis_con = redis_pool.get().context("Redis pool in download_track")?;
+            let track_id = DatabaseManager::get_judge_submission_id(&mut conn, &song)
                 .context("Getting js id in download")?;
             let key = format!("dl:{track_id}:progress");
             let track = loop {

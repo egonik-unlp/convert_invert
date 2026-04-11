@@ -16,11 +16,19 @@ pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 #[instrument(name = "main-span")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let connection = &mut establish_connection();
-    connection
-        .run_pending_migrations(MIGRATIONS)
-        .expect("CANT RUN MIGS");
+    let db_pool = convert_invert::internals::database::init_pool();
+    {
+        let mut connection = db_pool.get().context("Initial migration connection")?;
+        connection
+            .run_pending_migrations(MIGRATIONS)
+            .expect("CANT RUN MIGS");
+    }
+
     let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
+    let redis_pool = redis::r2d2::Pool::builder()
+        .build(redis_client)
+        .expect("Failed to create Redis pool");
+
     let mut config = Config::try_from_env().context("Cannot read env vars for config")?;
     let attempt_num: usize = match std::env::args().nth(1) {
         Some(value) => value.parse().unwrap(),
@@ -38,6 +46,8 @@ async fn main() -> anyhow::Result<()> {
         config.judge_score_levenshtein,
         download_path.clone(),
         config.clone(),
+        db_pool.clone(),
+        redis_pool.clone(),
     );
 
     let playlist = managers.get_playlist().await;
@@ -52,9 +62,11 @@ async fn main() -> anyhow::Result<()> {
             config.judge_score_levenshtein,
             download_path.clone(),
             config.clone(),
+            db_pool.clone(),
+            redis_pool.clone(),
         );
         managers
-            .run_cycle(chunk, connection, redis_client.clone())
+            .run_cycle(chunk)
             .await
             .unwrap();
         tracing::info!(cycle_n = count, "\n\nDone with cycle\n\n");

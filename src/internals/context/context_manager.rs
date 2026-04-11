@@ -78,12 +78,16 @@ pub async fn send(message: Track, chan: &Sender<Track>) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub type RedisPool = redis::r2d2::Pool<redis::Client>;
+
 pub struct Managers {
     pub client: Arc<Client>,
     pub download_manager: DownloadManager,
     pub search_manager: SearchManager,
     pub query_manager: QueryManager,
     pub judge_manager: JudgeManager,
+    pub db_pool: crate::internals::database::DbPool,
+    pub redis_pool: RedisPool,
 }
 
 #[derive(Debug)]
@@ -119,7 +123,7 @@ pub enum QueuePriority {
 }
 
 impl Managers {
-    pub fn new(score: Option<f32>, path: PathBuf, config: Config) -> Self {
+    pub fn new(score: Option<f32>, path: PathBuf, config: Config, db_pool: crate::internals::database::DbPool, redis_pool: RedisPool) -> Self {
         let client_settings = ClientSettings {
             username: config.user_name,
             password: config.user_password,
@@ -144,6 +148,8 @@ impl Managers {
             search_manager,
             judge_manager,
             query_manager,
+            db_pool,
+            redis_pool,
         }
     }
     pub async fn get_playlist(&self) -> Vec<Track> {
@@ -160,15 +166,14 @@ impl Managers {
         Ok(sender)
     }
 
-    #[instrument(name = "run-cyle", skip(self, tracks, connection, redis_client))]
+    #[instrument(name = "run-cyle", skip(self, tracks))]
     pub async fn run_cycle(
         self,
         tracks: impl IntoIterator<Item = Track>,
-        connection: &mut PgConnection,
-        mut redis_client: redis::Client,
     ) -> anyhow::Result<()> {
         let managers = Arc::new(self);
-        let mut database_manager = DatabaseManager::new(connection);
+        let mut conn = managers.db_pool.get().context("Acquiring DB connection from pool")?;
+        let mut database_manager = DatabaseManager::new(&mut conn);
         let (sender, mut receiver) = mpsc::channel(20000);
 
         managers.client.login().context("Could not connect")?;
@@ -185,11 +190,16 @@ impl Managers {
             download_semaphore.available_permits()
         );
         let manager_span = info_span!("context-span");
-        redis_client.set::<_, _, ()>("shutdown", false).unwrap();
-        let spawned_redis = redis_client.clone();
+        
+        {
+            let mut redis_con = managers.redis_pool.get().context("Acquiring Redis connection")?;
+            redis_con.set::<_, _, ()>("shutdown", false).unwrap();
+        }
+        
+        let redis_pool_clone = managers.redis_pool.clone();
         let task_manager: JoinHandle<anyhow::Result<()>> = tokio::spawn(
             async move {
-                await_pending_tasks(task_receiver, spawned_redis)
+                await_pending_tasks(task_receiver, redis_pool_clone)
                     .await
                     .context("Awaiting tasks")?;
                 Ok(())
@@ -251,18 +261,17 @@ impl Managers {
                                     tracing::info!(?judge_submission, "Enter downloadable");
                                     let judge_sub = judge_submission.clone();
                                     let sender = Arc::clone(&sender);
-                                    let redis_client = redis_client.clone();
                                     
                                     let mut state_guard = state.write().await;
                                     if !state_guard.contains(&judge_submission.track) {
                                         state_guard.push(judge_submission.track.clone());
                                         drop(state_guard); // Release early
                                         
-                                        let redis_client = redis_client.clone();
+                                        let managers_clone = Arc::clone(&managers);
                                         let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                                            managers
+                                            managers_clone
                                                 .download_manager
-                                                .run(judge_sub, semaphore, sender, redis_client)
+                                                .run(judge_sub, semaphore, sender, managers_clone.redis_pool.clone(), managers_clone.db_pool.clone())
                                                 .await
                                                 .context("Downloading")?;
                                             Ok(())
@@ -305,7 +314,7 @@ impl Managers {
                                     let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                                         managers
                                             .search_manager
-                                            .run(search_item.track, 0, semaphore, sender)
+                                            .run(search_item.track, 3, semaphore, sender)
                                             .await
                                             .context("returning track")?;
                                         Ok(())
@@ -327,7 +336,8 @@ impl Managers {
                 _ = tokio::time::sleep(Duration::from_secs(3 * 60)) => {
                     let sender = task_sender.clone();
                     sender.send(QueuePriority::Terminate).await.context("SE ROMPIO EL CHAN CHAN")?;
-                    let shutdown: bool = redis_client.get::<&'static str, bool>("shutdown").unwrap();
+                    let mut redis_con = managers.redis_pool.get().unwrap();
+                    let shutdown: bool = redis_con.get::<&'static str, bool>("shutdown").unwrap();
                     println!("Shutdown = {}", shutdown);
                     if shutdown {
                         println!("BREAK LOOOP EL MAS IMPORTANTE");
@@ -350,7 +360,7 @@ impl Managers {
 #[instrument(name = "task manager", skip(receiver))]
 pub async fn await_pending_tasks(
     mut receiver: Receiver<QueuePriority>,
-    mut redis_client: redis::Client,
+    redis_pool: RedisPool,
 ) -> anyhow::Result<()> {
     let mut set = JoinSet::new();
     while let Some(msg) = receiver.recv().await {
@@ -370,7 +380,8 @@ pub async fn await_pending_tasks(
             .context("inner")?;
     }
     println!("\n\n\n\n STOPPED AWAIT PENDING TASKS\n\n\n");
-    redis_client
+    let mut redis_con = redis_pool.get().context("Acquiring Redis connection for shutdown flag")?;
+    redis_con
         .set::<&'static str, bool, ()>("shutdown", true)
         .unwrap();
     Ok(())
