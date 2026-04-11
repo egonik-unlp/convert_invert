@@ -55,7 +55,7 @@ diesel::table! {
 diesel::table! {
     search_items (id) {
         id -> Int4,
-        track_id -> Int4,
+        track_id -> Int8,
         track -> Varchar,
         artist -> Varchar,
         album -> Varchar,

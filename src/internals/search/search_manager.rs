@@ -22,7 +22,7 @@ const TIMES_WITH_NO_NEW_FILES: usize = 3;
 
 #[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
 pub struct SearchItem {
-    pub track_id: i32,
+    pub track_id: u64,
     pub track: String,
     pub album: String,
     pub artist: String,
@@ -35,7 +35,7 @@ impl SearchItem {
             album.hash(&mut s);
             artist.hash(&mut s);
             s.finish()
-        } as i32;
+        };
         SearchItem {
             track_id,
             track,

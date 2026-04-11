@@ -23,7 +23,7 @@ use crate::internals::{
 #[diesel(table_name = schema::search_items)]
 pub struct SearchItemRow {
     pub id: i32,
-    pub track_id: i32,
+    pub track_id: i64,
     pub track: String,
     pub artist: String,
     pub album: String,
@@ -32,7 +32,7 @@ pub struct SearchItemRow {
 #[derive(Debug, Clone, Insertable)]
 #[diesel(table_name = schema::search_items)]
 pub struct NewSearchItemRow {
-    pub track_id: i32,
+    pub track_id: i64,
     pub track: String,
     pub artist: String,
     pub album: String,
@@ -41,7 +41,7 @@ pub struct NewSearchItemRow {
 impl From<&RuntimeSearchItem> for NewSearchItemRow {
     fn from(value: &RuntimeSearchItem) -> Self {
         Self {
-            track_id: value.track_id,
+            track_id: value.track_id as i64,
             track: value.track.clone(),
             artist: value.artist.clone(),
             album: value.album.clone(),
@@ -58,7 +58,7 @@ impl From<RuntimeSearchItem> for NewSearchItemRow {
 impl From<SearchItemRow> for RuntimeSearchItem {
     fn from(value: SearchItemRow) -> Self {
         Self {
-            track_id: value.track_id,
+            track_id: value.track_id as u64,
             track: value.track,
             artist: value.artist,
             album: value.album,
