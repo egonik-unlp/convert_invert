@@ -1,7 +1,6 @@
 use actix_web::{App, HttpResponse, HttpServer, Responder, get, post, web};
 use convert_invert::internals::{
     context::context_manager::{Managers, Track},
-    database::establish_connection,
     query::query_manager::QueryManager,
     search::search_manager::SearchItem,
     utils::config::config_manager::Config,
@@ -295,7 +294,7 @@ async fn stop_workers(state: web::Data<AppState>, req: web::Json<StopRequest>) -
     let mut stopped: Vec<u32> = Vec::new();
     let mut remaining: Vec<WorkerHandle> = Vec::with_capacity(guard.len());
 
-    for mut entry in guard.drain(..) {
+    for entry in guard.drain(..) {
         let should_stop = match &target_ids {
             None => true,
             Some(ids) => ids.contains(&(entry.info.id as u32)),
@@ -391,7 +390,7 @@ async fn main() -> anyhow::Result<()> {
     }
     
     let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
-    let redis_pool = redis::r2d2::Pool::builder()
+    let redis_pool = diesel::r2d2::Pool::builder()
         .build(redis_client)
         .expect("Failed to create Redis pool");
 

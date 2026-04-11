@@ -4,7 +4,7 @@ use itertools::Itertools;
 use std::{path::PathBuf, str::FromStr};
 use tracing::instrument;
 
-use convert_invert::internals::database::establish_connection;
+use convert_invert::internals::database::init_pool;
 use convert_invert::internals::{
     context::context_manager::Managers,
     utils::{config::config_manager::Config, trace},
@@ -16,7 +16,7 @@ pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("./migrations");
 #[instrument(name = "main-span")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let db_pool = convert_invert::internals::database::init_pool();
+    let db_pool = init_pool();
     {
         let mut connection = db_pool.get().context("Initial migration connection")?;
         connection
@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let redis_client = redis::Client::open("redis://localhost:6379").unwrap();
-    let redis_pool = redis::r2d2::Pool::builder()
+    let redis_pool = diesel::r2d2::Pool::builder()
         .build(redis_client)
         .expect("Failed to create Redis pool");
 
@@ -65,10 +65,7 @@ async fn main() -> anyhow::Result<()> {
             db_pool.clone(),
             redis_pool.clone(),
         );
-        managers
-            .run_cycle(chunk)
-            .await
-            .unwrap();
+        managers.run_cycle(chunk).await.unwrap();
         tracing::info!(cycle_n = count, "\n\nDone with cycle\n\n");
         println!("CHUNKERO DUOS {count}")
     }
