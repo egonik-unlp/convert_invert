@@ -45,7 +45,7 @@ impl DownloadManager {
         let id = format!("{}", track.track.track_id);
         let is_banned = {
             let mut redis_con = redis_pool.get().context("Redis pool in run")?;
-            redis_con.sismember::<_, _, bool>("ban-list", id).unwrap_or(false)
+            redis_con.sismember::<_, _>("ban-list", id).unwrap_or(false)
         };
         if is_audio_file(track.query.filename.clone()) && !is_banned {
             let _permit = semaphore.acquire().await.context("acquiring semaphore")?;
