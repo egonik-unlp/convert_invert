@@ -350,13 +350,14 @@ pub async fn await_pending_tasks(
     mut redis_client: redis::Client,
 ) -> anyhow::Result<()> {
     let mut set = JoinSet::new();
-    let mut retries_queue = vec![];
     while let Some(msg) = receiver.recv().await {
         match msg {
             QueuePriority::NormalRun(join_handle) => {
                 set.spawn(async move { join_handle.await.context("Awaiting handle")? });
             }
-            QueuePriority::RetryRun(join_handle) => retries_queue.push(join_handle),
+            QueuePriority::RetryRun(join_handle) => {
+                set.spawn(async move { join_handle.await.context("Awaiting retry handle")? });
+            }
             QueuePriority::Terminate => break,
         }
     }
@@ -364,11 +365,6 @@ pub async fn await_pending_tasks(
     while let Some(res) = set.join_next().await {
         res.context("Failed returning from task")?
             .context("inner")?;
-    }
-    println!("Transition between regular and retries");
-    for task in retries_queue {
-        task.await.context("Awaiting retry")?.context("inner")?;
-        println!("AWAITED ONE");
     }
     println!("\n\n\n\n STOPPED AWAIT PENDING TASKS\n\n\n");
     redis_client
