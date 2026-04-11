@@ -172,24 +172,22 @@ pub async fn track_search_task(
     'main: loop {
         sleep(Duration::from_secs(10)).await;
         let results = client.get_search_results(&query_string);
-        let results_count: usize = results.iter().map(|res| res.files.len()).sum();
-        if !results.is_empty() && !total_files_found.eq(&results_count) {
-            total_files_found += results_count - total_files_found;
+        let current_total_files: usize = results.iter().map(|res| res.files.len()).sum();
+        
+        if current_total_files > total_files_found {
             for result in results {
-                let submisssions = SearchManager::build_submissions(data.clone(), result);
-                for submission in submisssions {
-                    if !previous_submissions.contains(&(
-                        submission.query.filename.clone(),
-                        submission.query.username.clone(),
-                    )) {
+                let submissions = SearchManager::build_submissions(data.clone(), result);
+                for submission in submissions {
+                    let key = (submission.query.filename.clone(), submission.query.username.clone());
+                    if !previous_submissions.contains(&key) {
                         send(Track::Result(submission.clone()), &sender)
                             .await
                             .context("Sending result")?;
-                        previous_submissions
-                            .insert((submission.query.filename, submission.query.username));
+                        previous_submissions.insert(key);
                     }
                 }
             }
+            total_files_found = current_total_files;
             count = 0;
         } else {
             count += 1;

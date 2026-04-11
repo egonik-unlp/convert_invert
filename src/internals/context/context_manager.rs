@@ -222,7 +222,7 @@ impl Managers {
                                     let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                                         managers
                                             .search_manager
-                                            .run(search_item, 0, semaphore, sender)
+                                            .run(search_item, 3, semaphore, sender)
                                             .await
                                             .context("returning track")?;
                                         Ok(())
