@@ -107,8 +107,6 @@ async fn download_track(
                 .context("Getting js id in download")?;
             let key = format!("dl:{track_id}:progress");
             let track = loop {
-                let id = format!("{}", song.track.track_id);
-                redis_con.sadd("ban-list", id).unwrap();
                 if started.elapsed() > hard_deadline {
                     let retry_request = RetryRequest {
                         request: song.clone(),
@@ -189,8 +187,6 @@ async fn download_track(
                         });
                     }
                     Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) => {
-                        let id = format!("{}", song.track.track_id);
-                        redis_con.sadd("ban-list", id).unwrap();
                         tracing::error!(?song, "Error descargando, se salio del loop");
                         break Track::Retry(RetryRequest {
                             request: song.clone(),
