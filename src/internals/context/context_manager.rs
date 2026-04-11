@@ -227,7 +227,6 @@ impl Managers {
                                             .context("returning track")?;
                                         Ok(())
                                     });
-                                    tokio::time::sleep(Duration::from_secs(3)).await;
                                     task_queue
                                         .send(QueuePriority::NormalRun(handle))
                                         .await
