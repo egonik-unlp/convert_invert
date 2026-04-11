@@ -252,7 +252,12 @@ impl Managers {
                                     let judge_sub = judge_submission.clone();
                                     let sender = Arc::clone(&sender);
                                     let redis_client = redis_client.clone();
-                                    if !state.read().await.contains(&judge_submission.track) {
+                                    
+                                    let mut state_guard = state.write().await;
+                                    if !state_guard.contains(&judge_submission.track) {
+                                        state_guard.push(judge_submission.track.clone());
+                                        drop(state_guard); // Release early
+                                        
                                         let redis_client = redis_client.clone();
                                         let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
                                             managers
@@ -267,6 +272,7 @@ impl Managers {
                                             .await
                                             .context("Submitting task to queue")?;
                                     } else {
+                                        drop(state_guard);
                                         let reject = RejectedTrack::new(
                                             judge_submission.clone(),
                                             RejectReason::AlreadyDownloaded,
@@ -275,8 +281,6 @@ impl Managers {
                                             .await
                                             .context("sending rejected_tracks")?;
                                     }
-                                    let mut write = state.write().await;
-                                    write.push(judge_submission.track);
                                 }
                                 Track::File(downloaded_file) => {
                                     tracing::info!(?downloaded_file, "Downloaded file");
