@@ -23,7 +23,7 @@ impl Config {
         let run_id = env::var("RUN_ID").unwrap_or("default_run_name".to_string());
         let log_level: EnvFilter = env::var("LOG_LEVEL").unwrap_or("debug".to_string()).into();
         let user_name = env::var("USER_NAME").unwrap_or("default".to_string());
-        let user_password = env::var("USER_NAME").unwrap_or("123456".to_string());
+        let user_password = env::var("USER_PASSWORD").unwrap_or("123456".to_string());
         let client_id = env::var("CLIENT_ID").ok();
         let client_secret = env::var("CLIENT_SECRET").ok();
         let judge_score_levenshtein: Option<f32> = {

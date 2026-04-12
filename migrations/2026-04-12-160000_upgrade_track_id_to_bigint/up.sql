@@ -1,0 +1,1 @@
+ALTER TABLE search_items ALTER COLUMN track_id TYPE BIGINT;

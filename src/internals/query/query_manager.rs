@@ -27,8 +27,8 @@ impl QueryManager {
         client_secret: Option<String>,
     ) -> Self {
         let playlist_url = playlist_url.into();
-        let client_id = client_id.unwrap();
-        let client_secret = client_secret.unwrap();
+        let client_id = client_id.unwrap_or_else(|| "default_id".to_string());
+        let client_secret = client_secret.unwrap_or_else(|| "default_secret".to_string());
         QueryManager {
             playlist_url,
             client_id,
