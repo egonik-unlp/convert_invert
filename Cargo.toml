@@ -29,7 +29,7 @@ tracing-subscriber = { version = "0.3.22", features = [
 spotify-rs = "0.4.1"
 uuid = "1.19.0"
 dotenvy = "0.15.7"
-rand = "0.9.2"
+rand = "0.9.3"
 tracing-opentelemetry = "0.25"
 opentelemetry = "0.24"
 opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
