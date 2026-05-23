@@ -1,3 +1,8 @@
+//! Standalone runner for the convert-invert engine.
+//!
+//! This binary provides a CLI interface to run the Spotify-to-Soulseek process
+//! for a single playlist using the core library's managed run cycle.
+
 use anyhow::Context;
 use diesel_migrations::{MigrationHarness, embed_migrations};
 use itertools::Itertools;

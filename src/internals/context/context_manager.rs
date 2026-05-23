@@ -22,6 +22,7 @@ use crate::internals::{
     utils::config::config_manager::Config,
 };
 
+/// Metadata for a successfully downloaded file.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DownloadedFile {
     pub filename: String,
@@ -41,6 +42,7 @@ struct RunCycleShared<'a> {
     download_semaphore: &'a Arc<Semaphore>,
 }
 
+/// A request to retry a failed search or download.
 #[derive(Debug)]
 pub struct RetryRequest {
     pub request: JudgeSubmission,
@@ -48,28 +50,42 @@ pub struct RetryRequest {
     pub failed_download_result: DownloadableFile,
 }
 
+/// The various stages and events in a track's lifecycle.
 #[derive(Debug)]
 pub enum Track {
+    /// A new search query to be performed.
     Query(SearchItem),
+    /// A candidate submission found for a track.
     Result(JudgeSubmission),
+    /// A candidate that has been judged and is ready for download.
     Downloadable(JudgeSubmission),
+    /// A file that has been successfully downloaded.
     File(DownloadedFile),
+    /// A request to retry a failed operation.
     Retry(RetryRequest),
+    /// A track that has been rejected for a specific reason.
     Reject(RejectedTrack),
 }
 
+/// Metadata for a track that was rejected.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RejectedTrack {
     track: JudgeSubmission,
     reason: RejectReason,
 }
 
+/// Reasons why a track candidate might be rejected.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum RejectReason {
+    /// The track has already been downloaded successfully.
     AlreadyDownloaded,
+    /// The candidate's score was below the required threshold.
     LowScore(f32),
+    /// The candidate was identified as non-music or invalid.
     NotMusic(String),
+    /// The peer providing the file is banned.
     Banned(String),
+    /// All search attempts were exhausted without finding a suitable candidate.
     AbandonedAttemptingSearch,
 }
 
@@ -83,6 +99,7 @@ impl RejectedTrack {
     }
 }
 
+/// Sends a `Track` event to the provided channel.
 pub async fn send(message: Track, chan: &Sender<Track>) -> anyhow::Result<()> {
     chan.send(message).await.context("Send to channel")?;
     Ok(())
@@ -90,6 +107,7 @@ pub async fn send(message: Track, chan: &Sender<Track>) -> anyhow::Result<()> {
 
 pub type RedisPool = diesel::r2d2::Pool<redis::Client>;
 
+/// Tuning parameters for a worker's execution.
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerTuning {
     /// Max in-flight search requests against Soulseek. Soulseek is rate-sensitive;
@@ -103,6 +121,7 @@ pub struct WorkerTuning {
 }
 
 impl WorkerTuning {
+    /// Loads tuning parameters from environment variables with sensible defaults.
     pub fn from_env() -> Self {
         Self {
             search_concurrency: env_usize("SEARCH_CONCURRENCY", 4),
@@ -119,17 +138,26 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// The central container for all service managers and shared state.
 pub struct Managers {
+    /// The shared Soulseek client.
     pub client: Arc<Client>,
+    /// Manager for file downloads.
     pub download_manager: DownloadManager,
+    /// Manager for Soulseek searches.
     pub search_manager: SearchManager,
+    /// Manager for Spotify playlist queries.
     pub query_manager: QueryManager,
+    /// Manager for candidate judging.
     pub judge_manager: JudgeManager,
+    /// The PostgreSQL connection pool.
     pub db_pool: crate::internals::database::DbPool,
+    /// The Redis connection pool.
     pub redis_pool: RedisPool,
 }
 
 impl Managers {
+    /// Creates a new `Managers` instance with the provided configuration.
     pub fn new(
         score: Option<f32>,
         path: PathBuf,
@@ -168,6 +196,11 @@ impl Managers {
             redis_pool,
         }
     }
+
+    /// Runs a single chunk of tracks through the search-judge-download pipeline.
+    ///
+    /// This method orchestrates the task lifecycle using a `JoinSet` and an internal
+    /// message channel. It ensures that all spawned tasks are completed before returning.
     #[instrument(name = "run-cyle", skip(self, tracks))]
     pub async fn run_cycle(self, tracks: impl IntoIterator<Item = Track>) -> anyhow::Result<()> {
         let managers = Arc::new(self);
