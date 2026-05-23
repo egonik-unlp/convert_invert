@@ -1,5 +1,3 @@
-use std::fmt::format;
-
 use async_trait::async_trait;
 use tracing::instrument;
 
@@ -23,7 +21,7 @@ impl Judge for Levenshtein {
         let a = format!("{}", submission.track);
         let b = submission.query.filename;
         let distance_val = str_distance::str_distance_normalized(a, b, distance);
-        tracing::info!("score = {}", distance_val);
+        tracing::debug!(score = distance_val, "Levenshtein score");
         let val = distance_val > self.score_cutoff as f64;
         Ok(val)
     }
@@ -33,7 +31,7 @@ impl Judge for Levenshtein {
         let a = format!("{}", submission.track);
         let b = submission.query.filename;
         let distance_val = str_distance::str_distance_normalized(a, b, distance);
-        tracing::info!("score = {}", distance_val);
+        tracing::debug!(score = distance_val, "Levenshtein score");
         Ok(distance_val as f32)
     }
     #[instrument(name = "Levenshtein::judge_block", skip(self))]

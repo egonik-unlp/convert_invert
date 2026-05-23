@@ -1,7 +1,7 @@
 // @generated automatically by Diesel CLI.
 
 pub mod sql_types {
-    #[derive(diesel::query_builder::QueryId, Clone, diesel::sql_types::SqlType)]
+    #[derive(diesel::sql_types::SqlType)]
     #[diesel(postgres_type(name = "reject_reason"))]
     pub struct RejectReason;
 }
@@ -11,7 +11,7 @@ diesel::table! {
         id -> Int4,
         filename -> Varchar,
         username -> Varchar,
-        size -> Int4,
+        size -> Int8,
     }
 }
 
@@ -19,6 +19,7 @@ diesel::table! {
     downloaded_file (id) {
         id -> Int4,
         filename -> Varchar,
+        track -> Nullable<Int4>,
     }
 }
 
@@ -55,7 +56,7 @@ diesel::table! {
 diesel::table! {
     search_items (id) {
         id -> Int4,
-        track_id -> Int8,
+        track_id -> Varchar,
         track -> Varchar,
         artist -> Varchar,
         album -> Varchar,
@@ -64,6 +65,7 @@ diesel::table! {
 
 diesel::joinable!(judge_submissions -> downloadable_files (query));
 diesel::joinable!(judge_submissions -> search_items (track));
+diesel::joinable!(downloaded_file -> search_items (track));
 diesel::joinable!(rejected_track -> judge_submissions (track));
 diesel::joinable!(retry_request -> downloadable_files (failed_download_result));
 diesel::joinable!(retry_request -> judge_submissions (request));

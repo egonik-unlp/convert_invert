@@ -84,6 +84,21 @@ Bun.serve({
         return new Response(JSON.stringify(response));
       },
       GET: () => new Response(JSON.stringify(storage))
+    },
+    "/score_multiple": {
+      POST: async (request: any[]): Promise<Response[]> => {
+        const requestValue: Submission[] = await request.json();
+        const promises = [];
+        for (const value of requestValue) {
+          promises.push(judge(value))
+        }
+
+        const response = Promise.all(promises);
+        const timeStamp = Date.now();
+        storage.set(Date.now(), JSON.stringify(requestValue));
+        return new Response(JSON.stringify(response));
+      },
+
     }
   }
 })

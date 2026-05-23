@@ -1,23 +1,15 @@
-//TODO: Remove lint allows
-#![allow(unused, dead_code)]
 use crate::internals::{
-    context::context_manager::{Track, send},
-    parsing::deserialize,
-    search::search_manager::SearchItem,
-    utils::config::config_manager::Config,
+    context::context_manager::Track, parsing::deserialize, search::search_manager::SearchItem,
 };
-use anyhow::Context;
-use itertools::Itertools;
-use rand::Rng;
-use spotify_rs::{ClientCredsClient, ClientCredsFlow, Token, client::Client, model::PlayableItem};
-use std::time::Duration;
-use tokio::{sync::mpsc::Sender, time::sleep};
+use anyhow::{Context, bail};
+use spotify_rs::model::PlayableItem;
 
 #[derive(Debug, Clone)]
 pub struct QueryManager {
     pub playlist_url: String,
-    client_id: String,
-    client_secret: String,
+    pub search_timeout_secs: u8,
+    client_id: Option<String>,
+    client_secret: Option<String>,
 }
 
 impl QueryManager {
@@ -26,26 +18,39 @@ impl QueryManager {
         client_id: Option<String>,
         client_secret: Option<String>,
     ) -> Self {
+        Self::new_with_timeout(playlist_url, client_id, client_secret, 10)
+    }
+
+    pub fn new_with_timeout(
+        playlist_url: impl Into<String>,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        search_timeout_secs: u8,
+    ) -> Self {
         let playlist_url = playlist_url.into();
-        let client_id = client_id.unwrap_or_else(|| "default_id".to_string());
-        let client_secret = client_secret.unwrap_or_else(|| "default_secret".to_string());
         QueryManager {
             playlist_url,
+            search_timeout_secs,
             client_id,
             client_secret,
         }
     }
     pub async fn fetch_playlist(self) -> anyhow::Result<Vec<Track>> {
-        let spotify =
-            spotify_rs::ClientCredsClient::authenticate(self.client_id, self.client_secret)
-                .await
-                .unwrap();
+        let Some(client_id) = self.client_id else {
+            bail!("CLIENT_ID is required to fetch Spotify playlist");
+        };
+        let Some(client_secret) = self.client_secret else {
+            bail!("CLIENT_SECRET is required to fetch Spotify playlist");
+        };
+        let spotify = spotify_rs::ClientCredsClient::authenticate(client_id, client_secret)
+            .await
+            .context("Authenticate Spotify client credentials")?;
 
         let playlist = spotify_rs::playlist(self.playlist_url)
             .market("US")
             .get(&spotify)
             .await
-            .unwrap();
+            .context("Fetch Spotify playlist")?;
         let pl = playlist
             .tracks
             .get_all(&spotify)
@@ -55,18 +60,22 @@ impl QueryManager {
             .flatten()
             .flat_map(|track| {
                 if let PlayableItem::Track(song) = track.track {
-                    let song2 = song.clone();
+                    let Some(artist) = song.artists.first() else {
+                        tracing::warn!(track = song.name, "Skipping Spotify track without artist");
+                        return None;
+                    };
                     Some(Track::Query(SearchItem::new(
-                        song.clone().name,
-                        song.clone().album.name,
-                        song2.artists.clone().first().unwrap().name.clone(),
+                        song.id,
+                        song.name,
+                        song.album.name,
+                        artist.name.clone(),
                     )))
                 } else {
                     None
                 }
             })
             .collect::<Vec<_>>();
-        println!("Playlist has {} songs", pl.len());
+        tracing::info!(track_count = pl.len(), "Fetched Spotify playlist");
         Ok(pl)
     }
     pub async fn run(&self) -> anyhow::Result<Vec<Track>> {

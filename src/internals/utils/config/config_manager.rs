@@ -13,35 +13,40 @@ pub struct Config {
     pub judge_score_llm: Option<f32>,
     pub listen_port: u32,
     pub search_timeout_secs: u8,
+    pub playlist_id: String,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
 }
 
 impl Config {
     pub fn try_from_env() -> anyhow::Result<Self> {
-        dotenvy::dotenv().context("Getting env vars")?;
-        let run_id = env::var("RUN_ID").unwrap_or("default_run_name".to_string());
+        dotenvy::dotenv().ok();
+        let run_id = env::var("RUN_ID").unwrap_or_else(|_| "default_run".to_string());
         let log_level: EnvFilter = env::var("LOG_LEVEL").unwrap_or("debug".to_string()).into();
         let user_name = env::var("USER_NAME").unwrap_or("default".to_string());
-        let user_password = env::var("USER_PASSWORD").unwrap_or("123456".to_string());
+        let user_password = env::var("USER_PASSWORD").unwrap_or_default();
         let client_id = env::var("CLIENT_ID").ok();
         let client_secret = env::var("CLIENT_SECRET").ok();
+        let playlist_id = env::var("PLAYLIST_ID")
+            .unwrap_or_else(|_| "4RNxYgx8c1WuDV7MItXel2?si=e5b2ceac9697423f".to_string());
         let judge_score_levenshtein: Option<f32> = {
             let val = env::var("JUDGE_SCORE_LEVENSHTEIN").ok();
-            val.map(|v| v.parse().expect("Cannot parse judge score levenshtein"))
+            val.map(|v| v.parse().context("Cannot parse JUDGE_SCORE_LEVENSHTEIN"))
+                .transpose()?
         };
         let judge_score_llm: Option<f32> = {
             let val = env::var("JUDGE_SCORE_LLM").ok();
-            val.map(|v| v.parse().expect("Cannot parse judge score llm"))
+            val.map(|v| v.parse().context("Cannot parse JUDGE_SCORE_LLM"))
+                .transpose()?
         };
         let listen_port: u32 = {
-            let val = env::var("LISTEN_PORT").unwrap_or("3124".to_string());
-            val.parse().context("cannot parse val")?
+            let val = env::var("LISTEN_PORT").unwrap_or_else(|_| "41000".to_string());
+            val.parse().context("Cannot parse LISTEN_PORT")?
         };
 
         let search_timeout_secs: u8 = {
             let val = env::var("SEARCH_TIMEOUT_SECS").unwrap_or("10".to_string());
-            val.parse().context("cannot parse val")?
+            val.parse().context("Cannot parse SEARCH_TIMEOUT_SECS")?
         };
         Ok(Config {
             run_id,
@@ -52,12 +57,12 @@ impl Config {
             judge_score_llm,
             listen_port,
             search_timeout_secs,
+            playlist_id,
             client_id,
             client_secret,
         })
     }
 
-    //TODO: Find a way
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         log_level: EnvFilter,
@@ -68,6 +73,7 @@ impl Config {
         listen_port: u32,
         search_timeout_secs: u8,
         run_id: String,
+        playlist_id: String,
         client_id: Option<String>,
         client_secret: Option<String>,
     ) -> Self {
@@ -80,6 +86,7 @@ impl Config {
             judge_score_llm,
             listen_port,
             search_timeout_secs,
+            playlist_id,
             client_id,
             client_secret,
         }

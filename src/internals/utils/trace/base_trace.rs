@@ -1,7 +1,7 @@
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
-pub fn init_tracing_base() {
+pub fn init_tracing_base() -> anyhow::Result<()> {
     let filter = EnvFilter::from_default_env().add_directive(Level::DEBUG.into());
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -16,5 +16,6 @@ pub fn init_tracing_base() {
         .with_target(true)
         // Build the subscriber
         .finish();
-    tracing::subscriber::set_global_default(subscriber).unwrap();
+    tracing::subscriber::set_global_default(subscriber)?;
+    Ok(())
 }

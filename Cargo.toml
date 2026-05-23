@@ -43,3 +43,7 @@ scopeguard = "1.2.0"
 redis = { version = "1.0.3", features = ["r2d2", "tokio-comp"] }
 diesel_migrations = { version = "2.3.1", features = ["postgres"] }
 actix-web = "4.12.1"
+actix-cors = "0.7.0"
+actix-governor = "0.8.0"
+subtle = "2.6.1"
+futures-util = "0.3.31"

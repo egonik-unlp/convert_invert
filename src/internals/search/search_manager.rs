@@ -8,7 +8,6 @@ use soulseek_rs::SearchResult;
 use std::{
     collections::HashSet,
     fmt::Display,
-    hash::{DefaultHasher, Hash, Hasher},
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
@@ -20,22 +19,19 @@ use tracing::{Instrument, info_span, instrument};
 
 const TIMES_WITH_NO_NEW_FILES: usize = 3;
 
+fn downloadable_size(size: u64) -> Option<i64> {
+    i64::try_from(size).ok()
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
 pub struct SearchItem {
-    pub track_id: u64,
+    pub track_id: String,
     pub track: String,
     pub album: String,
     pub artist: String,
 }
 impl SearchItem {
-    pub fn new(track: String, album: String, artist: String) -> Self {
-        let track_id = {
-            let mut s = DefaultHasher::new();
-            track.hash(&mut s);
-            album.hash(&mut s);
-            artist.hash(&mut s);
-            s.finish()
-        };
+    pub fn new(track_id: String, track: String, album: String, artist: String) -> Self {
         SearchItem {
             track_id,
             track,
@@ -43,28 +39,29 @@ impl SearchItem {
             artist,
         }
     }
+
+    pub fn from_metadata(track: String, album: String, artist: String) -> Self {
+        let track_id = format!("metadata:{track}:{artist}:{album}");
+        Self::new(track_id, track, album, artist)
+    }
 }
 impl From<Playlist> for Vec<SearchItem> {
     fn from(value: Playlist) -> Vec<SearchItem> {
-        let tracks = value.tracks.unwrap().items.unwrap();
-        tracks
+        value
+            .tracks
+            .and_then(|tracks| tracks.items)
+            .unwrap_or_default()
             .into_iter()
-            .map(|tr| {
-                let track = tr.clone().track.unwrap().name.unwrap();
-                let artist = tr
-                    .track
-                    .clone()
-                    .unwrap()
-                    .artists
-                    .unwrap()
-                    .first()
-                    .unwrap()
-                    .name
-                    .clone()
-                    .unwrap()
-                    .clone();
-                let album = tr.track.unwrap().album.unwrap().name.unwrap();
-                SearchItem::new(track, album, artist)
+            .filter_map(|tr| {
+                let track = tr.track?;
+                let track_name = track.name?;
+                let album_name = track.album?.name?;
+                let artist_name = track.artists?.first()?.name.clone()?;
+                Some(SearchItem::from_metadata(
+                    track_name,
+                    album_name,
+                    artist_name,
+                ))
             })
             .collect()
     }
@@ -74,7 +71,7 @@ impl From<Playlist> for Vec<SearchItem> {
 pub struct DownloadableFile {
     pub filename: String,
     pub username: String,
-    pub size: i32,
+    pub size: i64,
 }
 impl Display for SearchItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -95,28 +92,37 @@ impl PartialEq for JudgeSubmission {
 
 pub struct SearchManager {
     pub client: Arc<soulseek_rs::Client>,
-    pub handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
 
 impl SearchManager {
     pub fn new(client: Arc<soulseek_rs::Client>) -> Self {
-        SearchManager {
-            client,
-            handles: vec![],
-        }
+        SearchManager { client }
     }
     fn build_submissions(track: SearchItem, result: SearchResult) -> Vec<JudgeSubmission> {
         result
             .files
             .into_iter()
-            .map(|f| JudgeSubmission {
-                query: DownloadableFile {
-                    filename: f.name,
-                    size: f.size as i32,
-                    username: f.username,
-                },
-                track: track.clone(),
-                score: None,
+            .filter_map(|f| {
+                let size = match downloadable_size(f.size) {
+                    Some(size) => size,
+                    None => {
+                        tracing::warn!(
+                            filename = f.name,
+                            size = f.size,
+                            "Skipping search result with size too large for storage"
+                        );
+                        return None;
+                    }
+                };
+                Some(JudgeSubmission {
+                    query: DownloadableFile {
+                        filename: f.name,
+                        size,
+                        username: f.username,
+                    },
+                    track: track.clone(),
+                    score: None,
+                })
             })
             .collect()
     }
@@ -124,12 +130,13 @@ impl SearchManager {
         &self,
         track: SearchItem,
         count_cutoff: usize,
+        timeout_secs: u8,
         semaphore: Arc<Semaphore>,
         sender: Arc<Sender<Track>>,
     ) -> anyhow::Result<()> {
         let client = self.client.clone();
         let _permit = semaphore.acquire().await.context("Getting permit")?;
-        track_search_task(client, track, count_cutoff, sender)
+        track_search_task(client, track, count_cutoff, timeout_secs, sender)
             .await
             .context("TST")?;
         Ok(())
@@ -148,9 +155,11 @@ pub async fn track_search_task(
     client: Arc<soulseek_rs::Client>,
     data: SearchItem,
     count_cutoff: usize,
+    timeout_secs: u8,
     sender: Arc<Sender<Track>>,
 ) -> anyhow::Result<()> {
     let query_string = format!("{} - {}", data.track.as_str(), data.artist);
+    let search_timeout = Duration::from_secs(u64::from(timeout_secs.max(1)));
     let cancel = Arc::new(AtomicBool::new(false));
     let span = info_span!("track_blocking");
     let search_thread = {
@@ -160,7 +169,7 @@ pub async fn track_search_task(
         tokio::task::spawn_blocking(move || {
             search_client.search_with_cancel(
                 query_string_search.as_str(),
-                Duration::from_secs(30), // Reduced duration for faster exit
+                search_timeout,
                 Some(cancel_search),
             )
         })
@@ -170,15 +179,18 @@ pub async fn track_search_task(
     let mut count = 0;
     let mut total_files_found = 0;
     'main: loop {
-        sleep(Duration::from_secs(10)).await;
+        sleep(search_timeout).await;
         let results = client.get_search_results(&query_string);
         let current_total_files: usize = results.iter().map(|res| res.files.len()).sum();
-        
+
         if current_total_files > total_files_found {
             for result in results {
                 let submissions = SearchManager::build_submissions(data.clone(), result);
                 for submission in submissions {
-                    let key = (submission.query.filename.clone(), submission.query.username.clone());
+                    let key = (
+                        submission.query.filename.clone(),
+                        submission.query.username.clone(),
+                    );
                     if !previous_submissions.contains(&key) {
                         send(Track::Result(submission.clone()), &sender)
                             .await
@@ -205,7 +217,35 @@ pub async fn track_search_task(
     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
     search_thread
         .await
-        .unwrap()
+        .context("Search thread join failed")?
         .context("Inner search thread issue")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SearchItem, downloadable_size};
+
+    #[test]
+    fn metadata_fallback_id_is_deterministic() {
+        let first = SearchItem::from_metadata(
+            "Track".to_string(),
+            "Album".to_string(),
+            "Artist".to_string(),
+        );
+        let second = SearchItem::from_metadata(
+            "Track".to_string(),
+            "Album".to_string(),
+            "Artist".to_string(),
+        );
+
+        assert_eq!(first.track_id, second.track_id);
+        assert_eq!(first.track_id, "metadata:Track:Artist:Album");
+    }
+
+    #[test]
+    fn downloadable_size_rejects_values_that_do_not_fit_database_type() {
+        assert_eq!(downloadable_size(i64::MAX as u64), Some(i64::MAX));
+        assert_eq!(downloadable_size(i64::MAX as u64 + 1), None);
+    }
 }

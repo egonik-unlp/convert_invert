@@ -1,0 +1,7 @@
+target
+.env
+*.log
+logs-script*
+saranga
+dempe
+pedito.txt

@@ -23,7 +23,7 @@ use crate::internals::{
 #[diesel(table_name = schema::search_items)]
 pub struct SearchItemRow {
     pub id: i32,
-    pub track_id: i64,
+    pub track_id: String,
     pub track: String,
     pub artist: String,
     pub album: String,
@@ -32,7 +32,7 @@ pub struct SearchItemRow {
 #[derive(Debug, Clone, Insertable)]
 #[diesel(table_name = schema::search_items)]
 pub struct NewSearchItemRow {
-    pub track_id: i64,
+    pub track_id: String,
     pub track: String,
     pub artist: String,
     pub album: String,
@@ -41,7 +41,7 @@ pub struct NewSearchItemRow {
 impl From<&RuntimeSearchItem> for NewSearchItemRow {
     fn from(value: &RuntimeSearchItem) -> Self {
         Self {
-            track_id: value.track_id as i64,
+            track_id: value.track_id.clone(),
             track: value.track.clone(),
             artist: value.artist.clone(),
             album: value.album.clone(),
@@ -58,7 +58,7 @@ impl From<RuntimeSearchItem> for NewSearchItemRow {
 impl From<SearchItemRow> for RuntimeSearchItem {
     fn from(value: SearchItemRow) -> Self {
         Self {
-            track_id: value.track_id as u64,
+            track_id: value.track_id,
             track: value.track,
             artist: value.artist,
             album: value.album,
@@ -72,7 +72,7 @@ pub struct DownloadableFileRow {
     pub id: i32,
     pub filename: String,
     pub username: String,
-    pub size: i32,
+    pub size: i64,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -80,7 +80,7 @@ pub struct DownloadableFileRow {
 pub struct NewDownloadableFileRow {
     pub filename: String,
     pub username: String,
-    pub size: i32,
+    pub size: i64,
 }
 
 impl From<&RuntimeDownloadableFile> for NewDownloadableFileRow {
@@ -150,32 +150,21 @@ impl From<JudgeSubmissionJoined> for RuntimeJudgeSubmission {
 pub struct DownloadedFileRow {
     pub id: i32,
     pub filename: String,
+    pub track: Option<i32>,
 }
 
 #[derive(Debug, Clone, Insertable)]
 #[diesel(table_name = schema::downloaded_file)]
 pub struct NewDownloadedFileRow {
     pub filename: String,
+    pub track: Option<i32>,
 }
 
-impl From<&DownloadedFile> for NewDownloadedFileRow {
-    fn from(value: &DownloadedFile) -> Self {
+impl NewDownloadedFileRow {
+    pub fn from_runtime(value: &DownloadedFile, track: Option<i32>) -> Self {
         Self {
             filename: value.filename.clone(),
-        }
-    }
-}
-
-impl From<DownloadedFile> for NewDownloadedFileRow {
-    fn from(value: DownloadedFile) -> Self {
-        Self::from(&value)
-    }
-}
-
-impl From<DownloadedFileRow> for DownloadedFile {
-    fn from(value: DownloadedFileRow) -> Self {
-        Self {
-            filename: value.filename,
+            track,
         }
     }
 }
@@ -222,6 +211,7 @@ pub enum RejectReasonRow {
     AlreadyDownloaded,
     LowScore,
     NotMusic,
+    Banned,
     AbandonedAttemptingSearch,
 }
 
@@ -231,6 +221,7 @@ impl From<&RuntimeRejectReason> for RejectReasonRow {
             RuntimeRejectReason::AlreadyDownloaded => Self::AlreadyDownloaded,
             RuntimeRejectReason::LowScore(_) => Self::LowScore,
             RuntimeRejectReason::NotMusic(_) => Self::NotMusic,
+            RuntimeRejectReason::Banned(_) => Self::Banned,
             RuntimeRejectReason::AbandonedAttemptingSearch => Self::AbandonedAttemptingSearch,
         }
     }
@@ -249,6 +240,7 @@ impl From<RejectReasonRow> for RuntimeRejectReason {
             // Database enum intentionally drops payload details.
             RejectReasonRow::LowScore => RuntimeRejectReason::LowScore(0.0),
             RejectReasonRow::NotMusic => RuntimeRejectReason::NotMusic(String::new()),
+            RejectReasonRow::Banned => RuntimeRejectReason::Banned(String::new()),
             RejectReasonRow::AbandonedAttemptingSearch => {
                 RuntimeRejectReason::AbandonedAttemptingSearch
             }
@@ -262,6 +254,7 @@ impl ToSql<sql_types::RejectReason, Pg> for RejectReasonRow {
             RejectReasonRow::AlreadyDownloaded => b"already_downloaded".as_slice(),
             RejectReasonRow::LowScore => b"low_score".as_slice(),
             RejectReasonRow::NotMusic => b"not_music".as_slice(),
+            RejectReasonRow::Banned => b"banned".as_slice(),
             RejectReasonRow::AbandonedAttemptingSearch => b"abandoned_attempting_search".as_slice(),
         };
         out.write_all(value)?;
@@ -275,6 +268,7 @@ impl FromSql<sql_types::RejectReason, Pg> for RejectReasonRow {
             b"already_downloaded" => Ok(Self::AlreadyDownloaded),
             b"low_score" => Ok(Self::LowScore),
             b"not_music" => Ok(Self::NotMusic),
+            b"banned" => Ok(Self::Banned),
             b"abandoned_attempting_search" => Ok(Self::AbandonedAttemptingSearch),
             unknown => Err(format!(
                 "Unrecognized reject_reason value: {}",
@@ -313,6 +307,7 @@ impl NewRejectedTrackRow {
                 | RuntimeRejectReason::AbandonedAttemptingSearch => None,
                 RuntimeRejectReason::LowScore(score) => Some(format!("{score}")),
                 RuntimeRejectReason::NotMusic(filename) => Some(filename.to_owned()),
+                RuntimeRejectReason::Banned(track_id) => Some(track_id.to_owned()),
             },
         }
     }

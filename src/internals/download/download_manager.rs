@@ -42,27 +42,35 @@ impl DownloadManager {
     ) -> anyhow::Result<()> {
         let client = Arc::clone(&self.client);
         let download_location = self.root_location.clone();
-        let id = format!("{}", track.track.track_id);
+        let id = track.track.track_id.clone();
         let is_banned = {
             let mut redis_con = redis_pool.get().context("Redis pool in run")?;
             redis_con.sismember::<_, _>("ban-list", id).unwrap_or(false)
         };
         if is_audio_file(track.query.filename.clone()) && !is_banned {
             let _permit = semaphore.acquire().await.context("acquiring semaphore")?;
-            tracing::info!(track.query.filename, "send to download");
-            let track = download_track(track, download_location.clone(), client, redis_pool, db_pool)
-                .await
-                .context("Downloading track")?;
+            tracing::debug!(track.query.filename, "send to download");
+            let track = download_track(
+                track,
+                download_location.clone(),
+                client,
+                redis_pool,
+                db_pool,
+            )
+            .await
+            .context("Downloading track")?;
             send(track, &sender).await.context("Sending to finish")?;
         } else {
-            let reject = RejectedTrack::new(
-                track.clone(),
-                RejectReason::NotMusic(track.query.filename.clone()),
-            );
+            let reason = if is_banned {
+                RejectReason::Banned(track.track.track_id.clone())
+            } else {
+                RejectReason::NotMusic(track.query.filename.clone())
+            };
+            let reject = RejectedTrack::new(track.clone(), reason);
             send(Track::Reject(reject), &sender)
                 .await
                 .context("Rejection sending to chan")?;
-            tracing::info!(
+            tracing::debug!(
                 track.query.filename,
                 "Rejected non song & already downloaded file",
             );
@@ -89,7 +97,7 @@ async fn download_track(
     let rec = client.download(
         song.query.filename.clone(),
         song.query.username.clone(),
-        song.query.size as u64,
+        u64::try_from(song.query.size).context("Download size cannot be converted to u64")?,
         path_str.to_string(),
     )?;
 
@@ -106,8 +114,12 @@ async fn download_track(
     let log_every = Duration::from_secs(10);
     let download_handle: JoinHandle<anyhow::Result<Track>> =
         tokio::task::spawn_blocking(move || {
-            let mut conn = db_pool.get().context("DB pool in download_track")?;
-            let mut redis_con = redis_pool.get().context("Redis pool in download_track")?;
+            let mut conn = db_pool
+                .get_timeout(Duration::from_secs(5))
+                .context("DB pool in download_track")?;
+            let mut redis_con = redis_pool
+                .get_timeout(Duration::from_secs(5))
+                .context("Redis pool in download_track")?;
             let track_id = DatabaseManager::get_judge_submission_id(&mut conn, &song)
                 .context("Getting js id in download")?;
             let key = format!("dl:{track_id}:progress");
@@ -133,7 +145,7 @@ async fn download_track(
                             break Track::Retry(retry_request);
                         }
                         if last_log.elapsed() > log_every {
-                            tracing::info!("Still queued: {}", song.query.filename);
+                            tracing::debug!("Still queued: {}", song.query.filename);
                             last_log = Instant::now();
                         }
                         continue;
@@ -156,7 +168,7 @@ async fn download_track(
                             break Track::Retry(retry_request);
                         }
                         if last_log.elapsed() > log_every {
-                            tracing::info!(
+                            tracing::debug!(
                                 "Downloaded {} of {} at {} B/s for {}",
                                 bytes_downloaded,
                                 total_bytes,
@@ -179,20 +191,20 @@ async fn download_track(
                         ];
                         redis_con
                             .hset_multiple::<String, String, _>(key.clone(), &values)
-                            .unwrap();
-                        // update redis (idealmente también rate-limited)
+                            .context("Write Redis download progress")?;
                         continue;
                     }
                     Ok(DownloadStatus::Completed) => {
                         redis_con
                             .hset(key.clone(), "completed".to_string(), format!("{}", true))
-                            .unwrap();
+                            .context("Mark Redis download completed")?;
                         break Track::File(DownloadedFile {
                             filename: song.query.filename,
+                            track: song.track,
                         });
                     }
                     Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) => {
-                        tracing::error!(?song, "Error descargando, se salio del loop");
+                        tracing::error!(?song, "Download failed or timed out");
                         break Track::Retry(RetryRequest {
                             request: song.clone(),
                             retry_attempts: 0,
@@ -200,8 +212,7 @@ async fn download_track(
                         });
                     }
                     Err(retry_or_tout) => {
-                        tracing::error!(?retry_or_tout, "Error downloadning");
-                        // si no recibís eventos, tratá esto como “posible stall”
+                        tracing::warn!(?retry_or_tout, "Download status receive error");
                         if last_progress.elapsed() > max_no_progress {
                             let retry_request = RetryRequest {
                                 request: song.clone(),
@@ -216,11 +227,28 @@ async fn download_track(
             };
             Ok(track)
         });
-    tracing::info!("EXIT OUT OF DOWNLOAD CLOSED LOOP IMPORTANTE IMPORTANTE");
-    println!("EXITTTTTTTTTT");
     let result = download_handle
         .await
         .context("Download thread exiting")?
         .context("Inner")?;
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_audio_file;
+
+    #[test]
+    fn audio_detection_accepts_supported_extensions_case_insensitively() {
+        assert!(is_audio_file("song.MP3".to_string()));
+        assert!(is_audio_file("song.flac".to_string()));
+        assert!(is_audio_file("song.AIFF".to_string()));
+        assert!(is_audio_file("song.aac".to_string()));
+    }
+
+    #[test]
+    fn audio_detection_rejects_unsupported_extensions() {
+        assert!(!is_audio_file("song.txt".to_string()));
+        assert!(!is_audio_file("song.mp3.exe".to_string()));
+    }
 }

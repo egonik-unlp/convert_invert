@@ -1,16 +1,16 @@
 use crate::internals::database::manager::DatabaseManager;
-use redis::Commands;
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
-use std::{path::PathBuf, sync::Arc, time::Duration};
-use tokio::{
-    sync::{
-        RwLock, Semaphore,
-        mpsc::{self, Receiver, Sender},
-    },
-    task::{JoinHandle, JoinSet},
+use std::{
+    collections::HashSet, future::Future, panic::AssertUnwindSafe, path::PathBuf, sync::Arc,
 };
-use tracing::{Instrument, info_span, instrument};
+use tokio::sync::{
+    Semaphore,
+    mpsc::{self, Sender},
+};
+use tokio::task::JoinSet;
+use tracing::instrument;
 
 use anyhow::Context;
 
@@ -25,6 +25,20 @@ use crate::internals::{
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DownloadedFile {
     pub filename: String,
+    pub track: SearchItem,
+}
+
+struct ManagedTaskResult {
+    pub label: &'static str,
+    pub error: Option<String>,
+}
+
+struct RunCycleShared<'a> {
+    managers: &'a Arc<Managers>,
+    sender: &'a Arc<Sender<Track>>,
+    state: &'a Arc<tokio::sync::RwLock<HashSet<SearchItem>>>,
+    search_semaphore: &'a Arc<Semaphore>,
+    download_semaphore: &'a Arc<Semaphore>,
 }
 
 #[derive(Debug)]
@@ -42,7 +56,6 @@ pub enum Track {
     File(DownloadedFile),
     Retry(RetryRequest),
     Reject(RejectedTrack),
-    NoMoreTracks,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,6 +69,7 @@ pub enum RejectReason {
     AlreadyDownloaded,
     LowScore(f32),
     NotMusic(String),
+    Banned(String),
     AbandonedAttemptingSearch,
 }
 
@@ -69,15 +83,41 @@ impl RejectedTrack {
     }
 }
 
-pub trait Manager {
-    fn run(self) -> anyhow::Result<()>;
-}
 pub async fn send(message: Track, chan: &Sender<Track>) -> anyhow::Result<()> {
     chan.send(message).await.context("Send to channel")?;
     Ok(())
 }
 
 pub type RedisPool = diesel::r2d2::Pool<redis::Client>;
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkerTuning {
+    /// Max in-flight search requests against Soulseek. Soulseek is rate-sensitive;
+    /// raise carefully.
+    pub search_concurrency: usize,
+    /// Max in-flight downloads. Keep this below the host's network and file
+    /// descriptor budget.
+    pub download_concurrency: usize,
+    /// Capacity of the work-distribution channel.
+    pub queue_capacity: usize,
+}
+
+impl WorkerTuning {
+    pub fn from_env() -> Self {
+        Self {
+            search_concurrency: env_usize("SEARCH_CONCURRENCY", 4),
+            download_concurrency: env_usize("DOWNLOAD_CONCURRENCY", 7),
+            queue_capacity: env_usize("QUEUE_CAPACITY", 20000),
+        }
+    }
+}
+
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
 
 pub struct Managers {
     pub client: Arc<Client>,
@@ -89,40 +129,14 @@ pub struct Managers {
     pub redis_pool: RedisPool,
 }
 
-#[derive(Debug)]
-pub struct RunTools {
-    pub download_semaphore: Semaphore,
-    pub search_semaphore: Semaphore,
-    pub successful_downloads: Vec<Track>,
-    pub rejected_tracks: Vec<Track>,
-    pub handles: Vec<JoinHandle<anyhow::Result<()>>>,
-}
-
-impl RunTools {
-    pub fn new(search_limit: usize, download_limit: usize) -> Self {
-        let search_semaphore = Semaphore::new(search_limit);
-        let download_semaphore = Semaphore::new(download_limit);
-        let successful_downloads = vec![];
-        let rejected_tracks = vec![];
-        let handles = vec![];
-        Self {
-            search_semaphore,
-            download_semaphore,
-            successful_downloads,
-            rejected_tracks,
-            handles,
-        }
-    }
-}
-
-pub enum QueuePriority {
-    NormalRun(JoinHandle<anyhow::Result<()>>),
-    RetryRun(JoinHandle<anyhow::Result<()>>),
-    Terminate,
-}
-
 impl Managers {
-    pub fn new(score: Option<f32>, path: PathBuf, config: Config, db_pool: crate::internals::database::DbPool, redis_pool: RedisPool) -> Self {
+    pub fn new(
+        score: Option<f32>,
+        path: PathBuf,
+        config: Config,
+        db_pool: crate::internals::database::DbPool,
+        redis_pool: RedisPool,
+    ) -> Self {
         let client_settings = ClientSettings {
             username: config.user_name,
             password: config.user_password,
@@ -134,12 +148,15 @@ impl Managers {
         let client = Arc::new(client);
         let download_manager = DownloadManager::new(client.clone(), path);
         let search_manager = SearchManager::new(client.clone());
-        let lev_judge = Levenshtein::new(score.unwrap_or(0.75));
-        let judge_manager = JudgeManager::new(Box::new(lev_judge));
-        let query_manager = QueryManager::new(
-            "4RNxYgx8c1WuDV7MItXel2?si=e5b2ceac9697423f",
+        let judge_threshold =
+            score.unwrap_or(crate::internals::judge::judge_manager::JUDGE_THRESHOLD);
+        let lev_judge = Levenshtein::new(judge_threshold);
+        let judge_manager = JudgeManager::new(Box::new(lev_judge), judge_threshold);
+        let query_manager = QueryManager::new_with_timeout(
+            config.playlist_id,
             config.client_id,
             config.client_secret,
+            config.search_timeout_secs,
         );
         Managers {
             client,
@@ -151,237 +168,295 @@ impl Managers {
             redis_pool,
         }
     }
-    pub async fn get_playlist(&self) -> Vec<Track> {
-        self.query_manager.clone().fetch_playlist().await.unwrap()
-    }
-    pub async fn inject_tracks(
-        track_chunk: impl IntoIterator<Item = Track>,
-        sender: Sender<Track>,
-    ) -> anyhow::Result<Sender<Track>> {
-        for track in track_chunk {
-            send(track, &sender).await.unwrap();
-        }
-        send(Track::NoMoreTracks, &sender).await.unwrap();
-        Ok(sender)
-    }
-
     #[instrument(name = "run-cyle", skip(self, tracks))]
-    pub async fn run_cycle(
-        self,
-        tracks: impl IntoIterator<Item = Track>,
-    ) -> anyhow::Result<()> {
+    pub async fn run_cycle(self, tracks: impl IntoIterator<Item = Track>) -> anyhow::Result<()> {
         let managers = Arc::new(self);
-        let mut conn = managers.db_pool.get().context("Acquiring DB connection from pool")?;
+        let tuning = WorkerTuning::from_env();
+        let mut conn = managers
+            .db_pool
+            .get()
+            .context("Acquiring DB connection from pool")?;
         let mut database_manager = DatabaseManager::new(&mut conn);
-        let (sender, mut receiver) = mpsc::channel(20000);
+        let (sender, mut receiver) = mpsc::channel(tuning.queue_capacity);
 
         managers.client.login().context("Could not connect")?;
 
         let sender = Arc::new(sender);
-        let storage = Vec::new();
-        let state = Arc::new(RwLock::new(storage));
-        let (task_sender, task_receiver) = mpsc::channel(300);
-        let search_semaphore = Arc::new(Semaphore::new(4));
-        let download_semaphore = Arc::new(Semaphore::new(7));
-        println!(
-            "\n\n\n\nStarted up new cycle\n\n\n\nAvailable Permits:\nSearch semaphore: {}\nDownload semaphore: {}",
-            search_semaphore.available_permits(),
-            download_semaphore.available_permits()
-        );
-        let manager_span = info_span!("context-span");
-        
-        {
-            let mut redis_con = managers.redis_pool.get().context("Acquiring Redis connection")?;
-            redis_con.set::<_, _, ()>("shutdown", false).unwrap();
-        }
-        
-        let redis_pool_clone = managers.redis_pool.clone();
-        let task_manager: JoinHandle<anyhow::Result<()>> = tokio::spawn(
-            async move {
-                await_pending_tasks(task_receiver, redis_pool_clone)
-                    .await
-                    .context("Awaiting tasks")?;
-                Ok(())
-            }
-            .instrument(manager_span),
+        let state = Arc::new(tokio::sync::RwLock::new(HashSet::new()));
+        let search_semaphore = Arc::new(Semaphore::new(tuning.search_concurrency));
+        let download_semaphore = Arc::new(Semaphore::new(tuning.download_concurrency));
+        tracing::info!(
+            search_permits = search_semaphore.available_permits(),
+            download_permits = download_semaphore.available_permits(),
+            "Started run cycle",
         );
         for track in tracks {
             sender.send(track).await.context("injecting tracks")?;
         }
-        loop {
+        let mut tasks = JoinSet::new();
+        let mut first_task_error: Option<String> = None;
+
+        while !receiver.is_empty() || !tasks.is_empty() {
             tokio::select! {
-                maybe_msg = receiver.recv() => {
-                    match maybe_msg {
-                        None => {
-                            println!("I do not expect to get here, ever");
-                            break;
-                        }
-                        Some(track) => {
-                            tracing::info!(?track, "Incoming package");
-                            let task_queue = task_sender.clone();
-                            database_manager
-                                .load_item_to_database(&track)
-                                .context("Load into database")?;
-                            match track {
-                                Track::Query(search_item) => {
-                                    let managers = Arc::clone(&managers);
-                                    let sender = Arc::clone(&sender);
-                                    let semaphore = search_semaphore.clone();
-                                    tracing::info!(?search_item, "Enter search_item");
-                                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                                        managers
-                                            .search_manager
-                                            .run(search_item, 3, semaphore, sender)
-                                            .await
-                                            .context("returning track")?;
-                                        Ok(())
-                                    });
-                                    task_queue
-                                        .send(QueuePriority::NormalRun(handle))
-                                        .await
-                                        .context("Submitting task to queue")?;
-                                }
-                                Track::Result(judge_submission) => {
-                                    let managers = Arc::clone(&managers);
-                                    let sender = Arc::clone(&sender);
-                                    tokio::spawn(async move {
-                                        tracing::info!(?judge_submission, "Enter result");
-                                        if let Err(e) = managers
-                                            .judge_manager
-                                            .run(judge_submission, sender)
-                                            .await {
-                                                tracing::error!(error = ?e, "Error in judge_manager.run");
-                                            }
-                                    });
-                                }
-                                Track::Downloadable(judge_submission) => {
-                                    let semaphore = download_semaphore.clone();
-                                    let managers = Arc::clone(&managers);
-                                    tracing::info!(?judge_submission, "Enter downloadable");
-                                    let judge_sub = judge_submission.clone();
-                                    let sender = Arc::clone(&sender);
-                                    
-                                    let mut state_guard = state.write().await;
-                                    if !state_guard.contains(&judge_submission.track) {
-                                        state_guard.push(judge_submission.track.clone());
-                                        drop(state_guard); // Release early
-                                        
-                                        let managers_clone = Arc::clone(&managers);
-                                        let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                                            managers_clone
-                                                .download_manager
-                                                .run(judge_sub, semaphore, sender, managers_clone.redis_pool.clone(), managers_clone.db_pool.clone())
-                                                .await
-                                                .context("Downloading")?;
-                                            Ok(())
-                                        });
-                                        task_queue
-                                            .send(QueuePriority::NormalRun(handle))
-                                            .await
-                                            .context("Submitting task to queue")?;
-                                    } else {
-                                        drop(state_guard);
-                                        let reject = RejectedTrack::new(
-                                            judge_submission.clone(),
-                                            RejectReason::AlreadyDownloaded,
-                                        );
-                                        send(Track::Reject(reject), &sender)
-                                            .await
-                                            .context("sending rejected_tracks")?;
-                                    }
-                                }
-                                Track::File(downloaded_file) => {
-                                    tracing::info!(?downloaded_file, "Downloaded file");
-                                }
-                                Track::Retry(mut retry_request) => {
-                                    if retry_request.retry_attempts >= 1 {
-                                        let reject = RejectedTrack::new(
-                                            retry_request.request,
-                                            RejectReason::AbandonedAttemptingSearch,
-                                        );
-                                        send(Track::Reject(reject), &sender)
-                                            .await
-                                            .context("rejecting")?;
-                                        continue;
-                                    }
-                                    retry_request.retry_attempts += 1;
-                                    let managers = Arc::clone(&managers);
-                                    let semaphore = search_semaphore.clone();
-                                    let sender = Arc::clone(&sender);
-                                    tracing::info!(?retry_request.request, "Retry zone");
-                                    let search_item = retry_request.request.clone();
-                                    let handle: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
-                                        managers
-                                            .search_manager
-                                            .run(search_item.track, 3, semaphore, sender)
-                                            .await
-                                            .context("returning track")?;
-                                        Ok(())
-                                    });
-                                    task_queue
-                                        .send(QueuePriority::RetryRun(handle))
-                                        .await
-                                        .context("Submitting task to queue")?;
-                                    tracing::info!(?retry_request, "Retry requestedfile")
-                                }
-                                Track::Reject(_rejected_track) => {}
-                                Track::NoMoreTracks => {
-                                    println!("No more tracks signal received");
-                                }
-                            }
-                        }
+                maybe_track = receiver.recv(), if !receiver.is_empty() => {
+                    let Some(track) = maybe_track else {
+                        break;
+                    };
+                    tracing::debug!(?track, "Incoming package");
+                    if first_task_error.is_some() {
+                        tracing::debug!(?track, "Dropping queued work after task failure");
+                        continue;
                     }
+                    let shared = RunCycleShared {
+                        managers: &managers,
+                        sender: &sender,
+                        state: &state,
+                        search_semaphore: &search_semaphore,
+                        download_semaphore: &download_semaphore,
+                    };
+                    process_track(track, shared, &mut database_manager, &mut tasks).await?;
                 }
-                _ = tokio::time::sleep(Duration::from_secs(3 * 60)) => {
-                    let sender = task_sender.clone();
-                    sender.send(QueuePriority::Terminate).await.context("SE ROMPIO EL CHAN CHAN")?;
-                    let mut redis_con = managers.redis_pool.get().unwrap();
-                    let shutdown: bool = redis_con.get::<&'static str, bool>("shutdown").unwrap();
-                    println!("Shutdown = {}", shutdown);
-                    if shutdown {
-                        println!("BREAK LOOOP EL MAS IMPORTANTE");
-                            break;
+                maybe_result = tasks.join_next(), if !tasks.is_empty() => {
+                    let task_result = match maybe_result {
+                        Some(Ok(result)) => result,
+                        Some(Err(err)) => ManagedTaskResult {
+                            label: "unknown",
+                            error: Some(format!("managed task join failed: {err}")),
+                        },
+                        None => continue,
+                    };
+                    if let Some(error) = task_result.error {
+                        let message = format!("{} task failed: {error}", task_result.label);
+                        tracing::error!(task_label = task_result.label, %error, "Managed task failed");
+                        first_task_error.get_or_insert(message);
                     }
                 }
             }
         }
         drop(sender);
-        drop(task_sender);
-        task_manager
-            .await
-            .context("Awaiting task manager shutdown")?
-            .context("Inner")?;
-        println!("END OF FUNCTION");
+        if let Some(error) = first_task_error {
+            anyhow::bail!(error);
+        }
+        tracing::info!("Run cycle finished");
         Ok(())
     }
 }
 
-#[instrument(name = "task manager", skip(receiver))]
-pub async fn await_pending_tasks(
-    mut receiver: Receiver<QueuePriority>,
-    redis_pool: RedisPool,
+async fn process_track(
+    track: Track,
+    shared: RunCycleShared<'_>,
+    database_manager: &mut DatabaseManager<'_>,
+    tasks: &mut JoinSet<ManagedTaskResult>,
 ) -> anyhow::Result<()> {
-    let mut set = JoinSet::new();
-    while let Some(msg) = receiver.recv().await {
-        match msg {
-            QueuePriority::NormalRun(join_handle) => {
-                set.spawn(async move { join_handle.await.context("Awaiting handle")? });
+    let RunCycleShared {
+        managers,
+        sender,
+        state,
+        search_semaphore,
+        download_semaphore,
+    } = shared;
+
+    database_manager
+        .load_item_to_database(&track)
+        .context("Load into database")?;
+    match track {
+        Track::Query(search_item) => {
+            let managers = Arc::clone(managers);
+            let sender = Arc::clone(sender);
+            let semaphore = search_semaphore.clone();
+            tracing::debug!(?search_item, "Scheduling search");
+            spawn_managed(tasks, "search", async move {
+                managers
+                    .search_manager
+                    .run(
+                        search_item,
+                        3,
+                        managers.query_manager_search_timeout(),
+                        semaphore,
+                        sender,
+                    )
+                    .await
+                    .context("returning track")?;
+                Ok(())
+            });
+        }
+        Track::Result(judge_submission) => {
+            let managers = Arc::clone(managers);
+            let sender = Arc::clone(sender);
+            spawn_managed(tasks, "judge", async move {
+                tracing::debug!(?judge_submission, "Scheduling judge");
+                managers
+                    .judge_manager
+                    .run(judge_submission, sender)
+                    .await
+                    .context("running judge")
+            });
+        }
+        Track::Downloadable(judge_submission) => {
+            if database_manager
+                .is_search_item_downloaded(&judge_submission.track)
+                .context("Check existing downloaded track")?
+            {
+                let reject =
+                    RejectedTrack::new(judge_submission.clone(), RejectReason::AlreadyDownloaded);
+                send(Track::Reject(reject), sender)
+                    .await
+                    .context("sending already downloaded rejection")?;
+                return Ok(());
             }
-            QueuePriority::RetryRun(join_handle) => {
-                set.spawn(async move { join_handle.await.context("Awaiting retry handle")? });
+            let semaphore = download_semaphore.clone();
+            let managers = Arc::clone(managers);
+            tracing::debug!(?judge_submission, "Scheduling download");
+            let judge_sub = judge_submission.clone();
+            let sender = Arc::clone(sender);
+
+            let mut state_guard = state.write().await;
+            if state_guard.insert(judge_submission.track.clone()) {
+                drop(state_guard);
+
+                let managers_clone = Arc::clone(&managers);
+                spawn_managed(tasks, "download", async move {
+                    managers_clone
+                        .download_manager
+                        .run(
+                            judge_sub,
+                            semaphore,
+                            sender,
+                            managers_clone.redis_pool.clone(),
+                            managers_clone.db_pool.clone(),
+                        )
+                        .await
+                        .context("Downloading")?;
+                    Ok(())
+                });
+            } else {
+                drop(state_guard);
+                let reject =
+                    RejectedTrack::new(judge_submission.clone(), RejectReason::AlreadyDownloaded);
+                send(Track::Reject(reject), &sender)
+                    .await
+                    .context("sending rejected_tracks")?;
             }
-            QueuePriority::Terminate => break,
+        }
+        Track::File(downloaded_file) => {
+            tracing::info!(?downloaded_file, "Downloaded file");
+        }
+        Track::Retry(mut retry_request) => {
+            state.write().await.remove(&retry_request.request.track);
+            if retry_request.retry_attempts >= 1 {
+                let reject = RejectedTrack::new(
+                    retry_request.request,
+                    RejectReason::AbandonedAttemptingSearch,
+                );
+                send(Track::Reject(reject), sender)
+                    .await
+                    .context("rejecting")?;
+                return Ok(());
+            }
+            retry_request.retry_attempts += 1;
+            let managers = Arc::clone(managers);
+            let semaphore = search_semaphore.clone();
+            let sender = Arc::clone(sender);
+            tracing::info!(?retry_request.request, "Retry requested");
+            let search_item = retry_request.request.clone();
+            spawn_managed(tasks, "retry_search", async move {
+                managers
+                    .search_manager
+                    .run(
+                        search_item.track,
+                        3,
+                        managers.query_manager_search_timeout(),
+                        semaphore,
+                        sender,
+                    )
+                    .await
+                    .context("returning track")?;
+                Ok(())
+            });
+            tracing::debug!(?retry_request, "Retry queued")
+        }
+        Track::Reject(rejected_track) => {
+            state.write().await.remove(&rejected_track.track.track);
         }
     }
-
-    while let Some(res) = set.join_next().await {
-        res.context("Failed returning from task")?
-            .context("inner")?;
-    }
-    println!("\n\n\n\n STOPPED AWAIT PENDING TASKS\n\n\n");
-    let mut redis_con = redis_pool.get().context("Acquiring Redis connection for shutdown flag")?;
-    redis_con
-        .set::<&'static str, bool, ()>("shutdown", true)
-        .unwrap();
     Ok(())
+}
+
+impl Managers {
+    fn query_manager_search_timeout(&self) -> u8 {
+        self.query_manager.search_timeout_secs
+    }
+}
+
+fn spawn_managed<F>(tasks: &mut JoinSet<ManagedTaskResult>, label: &'static str, future: F)
+where
+    F: Future<Output = anyhow::Result<()>> + Send + 'static,
+{
+    tasks.spawn(async move {
+        let result = AssertUnwindSafe(future).catch_unwind().await;
+        let error = match result {
+            Ok(Ok(())) => None,
+            Ok(Err(err)) => Some(format!("{err:?}")),
+            Err(_) => Some("task panicked".to_string()),
+        };
+        ManagedTaskResult { label, error }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ManagedTaskResult, spawn_managed};
+    use tokio::task::JoinSet;
+
+    async fn next_result(tasks: &mut JoinSet<ManagedTaskResult>) -> ManagedTaskResult {
+        tasks
+            .join_next()
+            .await
+            .expect("task result")
+            .expect("task joined")
+    }
+
+    #[tokio::test]
+    async fn managed_task_reports_success_by_label() {
+        let mut tasks = JoinSet::new();
+
+        spawn_managed(&mut tasks, "search", async { Ok(()) });
+
+        let result = next_result(&mut tasks).await;
+        assert_eq!(result.label, "search");
+        assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn managed_task_captures_errors() {
+        let mut tasks = JoinSet::new();
+
+        spawn_managed(&mut tasks, "download", async {
+            anyhow::bail!("download failed")
+        });
+
+        let result = next_result(&mut tasks).await;
+        assert_eq!(result.label, "download");
+        assert!(
+            result
+                .error
+                .expect("managed task error")
+                .contains("download failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_task_converts_panics_to_errors() {
+        let mut tasks = JoinSet::new();
+
+        spawn_managed(&mut tasks, "judge", async {
+            panic!("judge panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        let result = next_result(&mut tasks).await;
+        assert_eq!(result.label, "judge");
+        assert_eq!(result.error.as_deref(), Some("task panicked"));
+    }
 }

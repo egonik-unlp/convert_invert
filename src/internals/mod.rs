@@ -6,3 +6,4 @@ pub mod parsing;
 pub mod query;
 pub mod search;
 pub mod utils;
+pub mod worker;

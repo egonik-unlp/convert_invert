@@ -1,10 +1,36 @@
 # Convert Invert
 
-To run do:
+Rust synchronization engine and dashboard API.
+
+## Run With Docker
+
+From the repository root:
 
 ```bash
-cargo run --release
-docker compose up -d
+docker compose up --build
 ```
 
-For a full working logs + program.
+The API listens on `http://localhost:3124/api`, and the frontend is served through the root Compose stack.
+
+## Required Configuration
+
+Set these in the root `.env` or shell environment as needed:
+
+```bash
+CLIENT_ID=
+CLIENT_SECRET=
+USER_NAME=
+USER_PASSWORD=
+```
+
+The Compose defaults provide Postgres, Redis, Jaeger, and `/downloads` wiring for local development.
+
+## Analyze Worker Logs
+
+To compare a run against the reliability issues tracked in `PLAN-OVERHAUL.md`, run:
+
+```bash
+cargo run --bin analyze_run_log -- ../worker-docker-logs.log
+```
+
+The analyzer reports task-completion channel closures, searched/downloaded track counts, retries, empty-result exits, peer failures, and duplicate successful downloads by `track_id`.

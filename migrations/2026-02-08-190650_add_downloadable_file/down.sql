@@ -1,4 +1,4 @@
 -- This file should undo anything in `up.sql`
 --
 --
-DROP TABLE downloadable_file;
+DROP TABLE downloadable_files;
