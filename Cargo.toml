@@ -3,7 +3,8 @@ name = "convert-invert"
 version = "0.1.0"
 edition = "2024"
 default-run = "convert-invert"
-
+description = "Orchestrate spotify playlist downloads using soulseek-rs"
+license = "MIT"
 [lib]
 path = "./src/lib.rs"
 
