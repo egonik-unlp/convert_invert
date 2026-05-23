@@ -1,9 +1,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
+    time::Duration,
 };
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 #[derive(Default)]
@@ -13,6 +15,9 @@ struct LogStats {
     warning_lines: usize,
     error_lines: usize,
     channel_closed_completions: usize,
+    listener_bind_panics: usize,
+    db_pool_timeouts: usize,
+    duplicate_track_insert_errors: usize,
     retries: usize,
     empty_result_exits: usize,
     download_timeouts: usize,
@@ -20,6 +25,9 @@ struct LogStats {
     connection_refused: usize,
     no_route_to_host: usize,
     peer_disconnects: usize,
+    first_timestamp: Option<DateTime<Utc>>,
+    last_timestamp: Option<DateTime<Utc>>,
+    run_cycle_runtimes: Vec<Duration>,
     searched_track_ids: BTreeSet<String>,
     downloaded_by_track_id: BTreeMap<String, usize>,
 }
@@ -37,6 +45,21 @@ impl LogStats {
         };
         self.parsed_json_lines += 1;
 
+        if let Some(timestamp) = value
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_timestamp)
+        {
+            self.first_timestamp = Some(
+                self.first_timestamp
+                    .map_or(timestamp, |current| current.min(timestamp)),
+            );
+            self.last_timestamp = Some(
+                self.last_timestamp
+                    .map_or(timestamp, |current| current.max(timestamp)),
+            );
+        }
+
         let level = value
             .get("level")
             .and_then(Value::as_str)
@@ -52,6 +75,34 @@ impl LogStats {
             .and_then(Value::as_str)
             .unwrap_or_default();
         self.record_text(message);
+        if let Some(error) = value.pointer("/fields/error").and_then(Value::as_str) {
+            self.record_text(error);
+        }
+        if let Some(err) = value.pointer("/fields/err").and_then(Value::as_str) {
+            self.record_text(err);
+        }
+        if message == "close"
+            && value
+                .pointer("/target")
+                .and_then(Value::as_str)
+                .is_some_and(|target| target.ends_with("context::context_manager"))
+            && value
+                .pointer("/span/name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name == "run-chunk" || name == "run-cyle")
+            && let (Some(busy), Some(idle)) = (
+                value
+                    .pointer("/fields/time.busy")
+                    .and_then(Value::as_str)
+                    .and_then(parse_tracing_duration),
+                value
+                    .pointer("/fields/time.idle")
+                    .and_then(Value::as_str)
+                    .and_then(parse_tracing_duration),
+            )
+        {
+            self.run_cycle_runtimes.push(busy + idle);
+        }
         if message == "Failed to report task completion"
             && value
                 .pointer("/fields/err")
@@ -81,6 +132,21 @@ impl LogStats {
     fn record_text(&mut self, text: &str) {
         if text.contains("Failed to report task completion") && text.contains("channel closed") {
             self.channel_closed_completions += 1;
+        }
+        if (text.contains("Failed to bind listener to port")
+            || text.contains("listener bind panic")
+            || text.contains("AddrInUse"))
+            && (text.contains("panicked") || text.contains("panic") || text.contains("AddrInUse"))
+        {
+            self.listener_bind_panics += 1;
+        }
+        if text.contains("DB pool") && text.contains("timed out waiting for connection") {
+            self.db_pool_timeouts += 1;
+        }
+        if text.contains("duplicate key value violates unique constraint")
+            && text.contains("downloaded_file_track_uidx")
+        {
+            self.duplicate_track_insert_errors += 1;
         }
         if text.contains("Retry requested") {
             self.retries += 1;
@@ -116,11 +182,39 @@ impl LogStats {
         println!("run log summary");
         println!("  total_lines: {}", self.total_lines);
         println!("  parsed_json_lines: {}", self.parsed_json_lines);
+        if let Some(runtime) = self.log_runtime() {
+            println!("  log_runtime: {}", format_duration(runtime));
+        }
+        if !self.run_cycle_runtimes.is_empty() {
+            println!("  run_cycle_count: {}", self.run_cycle_runtimes.len());
+            println!(
+                "  run_cycle_runtime_total: {}",
+                format_duration(duration_sum(&self.run_cycle_runtimes))
+            );
+            println!(
+                "  run_cycle_runtime_avg: {}",
+                format_duration(duration_average(&self.run_cycle_runtimes))
+            );
+            println!(
+                "  run_cycle_runtime_min: {}",
+                format_duration(*self.run_cycle_runtimes.iter().min().unwrap())
+            );
+            println!(
+                "  run_cycle_runtime_max: {}",
+                format_duration(*self.run_cycle_runtimes.iter().max().unwrap())
+            );
+        }
         println!("  warning_lines: {}", self.warning_lines);
         println!("  error_lines: {}", self.error_lines);
         println!(
             "  task_completion_channel_closed: {}",
             self.channel_closed_completions
+        );
+        println!("  listener_bind_panics: {}", self.listener_bind_panics);
+        println!("  db_pool_timeouts: {}", self.db_pool_timeouts);
+        println!(
+            "  duplicate_track_insert_errors: {}",
+            self.duplicate_track_insert_errors
         );
         println!(
             "  unique_searched_tracks: {}",
@@ -151,6 +245,12 @@ impl LogStats {
             }
         }
     }
+
+    fn log_runtime(&self) -> Option<Duration> {
+        let first = self.first_timestamp?;
+        let last = self.last_timestamp?;
+        last.signed_duration_since(first).to_std().ok()
+    }
 }
 
 fn json_payload(line: &str) -> Option<&str> {
@@ -162,6 +262,65 @@ fn extract_after(value: &str, marker: &str) -> Option<String> {
     let rest = &value[start..];
     let end = rest.find('"')?;
     Some(rest[..end].to_string())
+}
+
+fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn parse_tracing_duration(value: &str) -> Option<Duration> {
+    let (number, multiplier) = if let Some(number) = value.strip_suffix("ns") {
+        (number, 1.0 / 1_000_000_000.0)
+    } else if let Some(number) = value
+        .strip_suffix("µs")
+        .or_else(|| value.strip_suffix("us"))
+    {
+        (number, 1.0 / 1_000_000.0)
+    } else if let Some(number) = value.strip_suffix("ms") {
+        (number, 1.0 / 1_000.0)
+    } else if let Some(number) = value.strip_suffix('s') {
+        (number, 1.0)
+    } else if let Some(number) = value.strip_suffix('m') {
+        (number, 60.0)
+    } else if let Some(number) = value.strip_suffix('h') {
+        (number, 3_600.0)
+    } else {
+        return None;
+    };
+
+    let seconds = number.parse::<f64>().ok()? * multiplier;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Some(Duration::from_secs_f64(seconds))
+}
+
+fn duration_sum(values: &[Duration]) -> Duration {
+    values.iter().copied().sum()
+}
+
+fn duration_average(values: &[Duration]) -> Duration {
+    duration_sum(values) / values.len() as u32
+}
+
+fn format_duration(duration: Duration) -> String {
+    let total_millis = duration.as_millis();
+    let millis = total_millis % 1_000;
+    let total_seconds = total_millis / 1_000;
+    let seconds = total_seconds % 60;
+    let total_minutes = total_seconds / 60;
+    let minutes = total_minutes % 60;
+    let hours = total_minutes / 60;
+
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}.{millis:03}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}.{millis:03}s")
+    } else {
+        format!("{seconds}.{millis:03}s")
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -179,32 +338,38 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::LogStats;
+    use std::time::Duration;
+
+    use super::{LogStats, format_duration, parse_tracing_duration};
 
     #[test]
     fn parses_key_reliability_signals_from_json_logs() {
         let mut stats = LogStats::default();
 
         stats.record(
-            r#"api-1 | {"level":"ERROR","fields":{"message":"Failed to report task completion","err":"Send to channel\n\nCaused by:\n    channel closed","label":"search"}}"#,
+            r#"api-1 | {"timestamp":"2026-05-23T17:47:45.659709Z","level":"ERROR","fields":{"message":"Failed to report task completion","err":"Send to channel\n\nCaused by:\n    channel closed","label":"search"}}"#,
         );
         stats.record(
-            r#"api-1 | {"level":"INFO","fields":{"message":"enter"},"span":{"name":"track_search_task","id":"track-1"}}"#,
+            r#"api-1 | {"timestamp":"2026-05-23T17:47:45.659709Z","level":"INFO","fields":{"message":"enter"},"span":{"name":"track_search_task","id":"track-1"}}"#,
         );
         stats.record(
-            r#"api-1 | {"level":"INFO","fields":{"message":"Downloaded file","downloaded_file":"DownloadedFile { filename: \"a.mp3\", track: SearchItem { track_id: \"track-1\", track: \"Song\", album: \"Album\", artist: \"Artist\" } }"}}"#,
+            r#"api-1 | {"timestamp":"2026-05-23T17:47:45.659709Z","level":"INFO","fields":{"message":"Downloaded file","downloaded_file":"DownloadedFile { filename: \"a.mp3\", track: SearchItem { track_id: \"track-1\", track: \"Song\", album: \"Album\", artist: \"Artist\" } }"}}"#,
         );
         stats.record(
-            r#"api-1 | {"level":"INFO","fields":{"message":"Downloaded file","downloaded_file":"DownloadedFile { filename: \"b.mp3\", track: SearchItem { track_id: \"track-1\", track: \"Song\", album: \"Album\", artist: \"Artist\" } }"}}"#,
+            r#"api-1 | {"timestamp":"2026-05-23T17:47:45.659709Z","level":"INFO","fields":{"message":"Downloaded file","downloaded_file":"DownloadedFile { filename: \"b.mp3\", track: SearchItem { track_id: \"track-1\", track: \"Song\", album: \"Album\", artist: \"Artist\" } }"}}"#,
         );
         stats.record(
-            r#"api-1 | {"level":"INFO","fields":{"message":"Exited because consecutive empty results"}}"#,
+            r#"api-1 | {"timestamp":"2026-05-23T17:47:45.659709Z","level":"INFO","fields":{"message":"Exited because consecutive empty results"}}"#,
         );
 
         assert_eq!(stats.total_lines, 5);
         assert_eq!(stats.parsed_json_lines, 5);
+        assert_eq!(stats.log_runtime(), Some(Duration::from_millis(0)));
         assert_eq!(stats.error_lines, 1);
         assert_eq!(stats.channel_closed_completions, 1);
+        assert_eq!(stats.listener_bind_panics, 0);
+        assert_eq!(stats.db_pool_timeouts, 0);
+        assert_eq!(stats.duplicate_track_insert_errors, 0);
         assert_eq!(stats.searched_track_ids.len(), 1);
         assert_eq!(stats.downloaded_by_track_id.get("track-1"), Some(&2));
         assert_eq!(stats.empty_result_exits, 1);
@@ -228,5 +393,87 @@ mod tests {
         assert_eq!(stats.no_route_to_host, 1);
         assert_eq!(stats.download_timeouts, 1);
         assert_eq!(stats.retries, 1);
+    }
+
+    #[test]
+    fn counts_stage_two_reliability_signals_from_text() {
+        let mut stats = LogStats::default();
+
+        stats.record(
+            "thread '<unnamed>' panicked at 'Failed to bind listener to port: Os { code: 98, kind: AddrInUse }'",
+        );
+        stats.record("DB pool in download_track: timed out waiting for connection");
+        stats.record(
+            "duplicate key value violates unique constraint \"downloaded_file_track_uidx\"",
+        );
+
+        assert_eq!(stats.listener_bind_panics, 1);
+        assert_eq!(stats.db_pool_timeouts, 1);
+        assert_eq!(stats.duplicate_track_insert_errors, 1);
+    }
+
+    #[test]
+    fn counts_stage_two_reliability_signals_from_json_messages() {
+        let mut stats = LogStats::default();
+
+        stats.record(
+            r#"api-1 | {"level":"ERROR","fields":{"message":"listener bind panic: Failed to bind listener to port: Os { code: 98, kind: AddrInUse }"}}"#,
+        );
+        stats.record(
+            r#"api-1 | {"level":"ERROR","fields":{"message":"DB pool in download_track: timed out waiting for connection"}}"#,
+        );
+        stats.record(
+            r#"api-1 | {"level":"ERROR","fields":{"message":"Managed task failed","error":"Downloading\n\nCaused by:\n    0: Downloading track\n    1: Inner\n    2: DB pool in download_track\n    3: timed out waiting for connection"}}"#,
+        );
+        stats.record(
+            r#"api-1 | {"level":"ERROR","fields":{"message":"duplicate key value violates unique constraint \"downloaded_file_track_uidx\""}}"#,
+        );
+
+        assert_eq!(stats.listener_bind_panics, 1);
+        assert_eq!(stats.db_pool_timeouts, 2);
+        assert_eq!(stats.duplicate_track_insert_errors, 1);
+    }
+
+    #[test]
+    fn records_log_and_run_cycle_runtimes() {
+        let mut stats = LogStats::default();
+
+        stats.record(
+            r#"api-1 | {"timestamp":"2026-05-23T17:47:45.659709Z","level":"INFO","fields":{"message":"Started run cycle"},"target":"convert_invert::internals::context::context_manager","span":{"name":"run-cyle"}}"#,
+        );
+        stats.record(
+            r#"api-1 | {"timestamp":"2026-05-23T17:51:56.260709Z","level":"INFO","fields":{"message":"close","time.busy":"601ms","time.idle":"250s"},"target":"convert_invert::internals::context::context_manager","span":{"name":"run-cyle"}}"#,
+        );
+        stats.record(
+            r#"api-1 | {"timestamp":"2026-05-23T17:52:36.260709Z","level":"INFO","fields":{"message":"close","time.busy":"1.02s","time.idle":"40.0s"},"target":"convert_invert::internals::context::context_manager","span":{"name":"run-chunk"}}"#,
+        );
+
+        assert_eq!(
+            stats.log_runtime(),
+            Some(Duration::from_secs(290) + Duration::from_millis(601))
+        );
+        assert_eq!(stats.run_cycle_runtimes.len(), 2);
+        assert_eq!(
+            stats.run_cycle_runtimes[0],
+            Duration::from_secs(250) + Duration::from_millis(601)
+        );
+        assert_eq!(
+            stats.run_cycle_runtimes[1],
+            Duration::from_secs(41) + Duration::from_millis(20)
+        );
+    }
+
+    #[test]
+    fn parses_and_formats_tracing_durations() {
+        assert_eq!(parse_tracing_duration("2s"), Some(Duration::from_secs(2)));
+        assert_eq!(
+            parse_tracing_duration("1.5ms"),
+            Some(Duration::from_micros(1_500))
+        );
+        assert_eq!(
+            parse_tracing_duration("42µs"),
+            Some(Duration::from_micros(42))
+        );
+        assert_eq!(format_duration(Duration::from_millis(61_234)), "1m 1.234s");
     }
 }

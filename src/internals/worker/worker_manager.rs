@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -310,10 +311,24 @@ async fn run_worker(config: WorkerRunConfig) {
     } = config;
 
     let queue_key = chunk_queue_key(&playlist_id, chunk_size);
+    let managers = match Managers::new(
+        worker_config.judge_score_levenshtein,
+        download_path.clone(),
+        worker_config.clone(),
+        db_pool.clone(),
+        redis_pool.clone(),
+    ) {
+        Ok(managers) => Arc::new(managers),
+        Err(err) => {
+            tracing::error!(?err, run_id = %worker_config.run_id, "Worker failed to start managers");
+            return;
+        }
+    };
 
     loop {
         if *shutdown.borrow() {
             tracing::info!(run_id = %worker_config.run_id, "Worker exiting due to shutdown");
+            managers.shutdown();
             return;
         }
 
@@ -349,19 +364,13 @@ async fn run_worker(config: WorkerRunConfig) {
             .into_iter()
             .map(Track::Query)
             .collect::<Vec<_>>();
-        let managers = Managers::new(
-            worker_config.judge_score_levenshtein,
-            download_path.clone(),
-            worker_config.clone(),
-            db_pool.clone(),
-            redis_pool.clone(),
-        );
 
         tokio::select! {
-            _ = managers.run_cycle(tracks) => {}
+            _ = managers.run_chunk(tracks) => {}
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     tracing::info!(run_id = %worker_config.run_id, "Worker shutdown mid-cycle");
+                    managers.shutdown();
                     return;
                 }
             }
@@ -383,17 +392,11 @@ async fn run_worker(config: WorkerRunConfig) {
                 .map(Track::Query)
                 .collect::<Vec<_>>();
             if !failed_items.is_empty() {
-                let managers = Managers::new(
-                    worker_config.judge_score_levenshtein,
-                    download_path,
-                    worker_config,
-                    db_pool,
-                    redis_pool,
-                );
-                let _ = managers.run_cycle(failed_items).await;
+                let _ = managers.run_chunk(failed_items).await;
             }
         }
     }
+    managers.shutdown();
 }
 
 #[cfg(test)]

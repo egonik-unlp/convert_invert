@@ -17,7 +17,18 @@ use tokio::{
 };
 use tracing::{Instrument, info_span, instrument};
 
-const TIMES_WITH_NO_NEW_FILES: usize = 3;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchExitReason {
+    NoCandidatesFound,
+    EmptyAfterPeerErrors,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchOutcome {
+    pub exit_reason: SearchExitReason,
+    pub candidates_sent: usize,
+}
 
 fn downloadable_size(size: u64) -> Option<i64> {
     i64::try_from(size).ok()
@@ -131,15 +142,23 @@ impl SearchManager {
         track: SearchItem,
         count_cutoff: usize,
         timeout_secs: u8,
+        relaxed_query: bool,
         semaphore: Arc<Semaphore>,
         sender: Arc<Sender<Track>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SearchOutcome> {
         let client = self.client.clone();
         let _permit = semaphore.acquire().await.context("Getting permit")?;
-        track_search_task(client, track, count_cutoff, timeout_secs, sender)
-            .await
-            .context("TST")?;
-        Ok(())
+        let outcome = track_search_task(
+            client,
+            track,
+            count_cutoff,
+            timeout_secs,
+            relaxed_query,
+            sender,
+        )
+        .await
+        .context("TST")?;
+        Ok(outcome)
     }
 }
 
@@ -156,9 +175,14 @@ pub async fn track_search_task(
     data: SearchItem,
     count_cutoff: usize,
     timeout_secs: u8,
+    relaxed_query: bool,
     sender: Arc<Sender<Track>>,
-) -> anyhow::Result<()> {
-    let query_string = format!("{} - {}", data.track.as_str(), data.artist);
+) -> anyhow::Result<SearchOutcome> {
+    let query_string = if relaxed_query {
+        data.track.clone()
+    } else {
+        format!("{} - {}", data.track.as_str(), data.artist)
+    };
     let search_timeout = Duration::from_secs(u64::from(timeout_secs.max(1)));
     let cancel = Arc::new(AtomicBool::new(false));
     let span = info_span!("track_blocking");
@@ -178,6 +202,7 @@ pub async fn track_search_task(
     let mut previous_submissions = HashSet::new();
     let mut count = 0;
     let mut total_files_found = 0;
+    let mut candidates_sent = 0usize;
     'main: loop {
         sleep(search_timeout).await;
         let results = client.get_search_results(&query_string);
@@ -196,6 +221,7 @@ pub async fn track_search_task(
                             .await
                             .context("Sending result")?;
                         previous_submissions.insert(key);
+                        candidates_sent += 1;
                     }
                 }
             }
@@ -206,8 +232,14 @@ pub async fn track_search_task(
         }
         if count > count_cutoff {
             tracing::info!(
-                times = TIMES_WITH_NO_NEW_FILES,
+                times = count_cutoff,
                 query_string = query_string,
+                relaxed_query,
+                exit_reason = if candidates_sent == 0 {
+                    "NoCandidatesFound"
+                } else {
+                    "EmptyAfterPeerErrors"
+                },
                 "Exited because consecutive empty results",
             );
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -215,11 +247,30 @@ pub async fn track_search_task(
         }
     }
     cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    search_thread
+    let search_result = search_thread
         .await
         .context("Search thread join failed")?
-        .context("Inner search thread issue")?;
-    Ok(())
+        .context("Inner search thread issue");
+    if let Err(err) = search_result {
+        tracing::warn!(
+            ?err,
+            query_string,
+            relaxed_query,
+            "Search task cancelled or failed"
+        );
+        return Ok(SearchOutcome {
+            exit_reason: SearchExitReason::Cancelled,
+            candidates_sent,
+        });
+    }
+    Ok(SearchOutcome {
+        exit_reason: if candidates_sent == 0 {
+            SearchExitReason::NoCandidatesFound
+        } else {
+            SearchExitReason::EmptyAfterPeerErrors
+        },
+        candidates_sent,
+    })
 }
 
 #[cfg(test)]

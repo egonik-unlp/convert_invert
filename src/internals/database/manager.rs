@@ -99,13 +99,26 @@ impl<'a> DatabaseManager<'a> {
                 .context("Fetch downloaded file track id")?,
         );
         let value = model::NewDownloadedFileRow::from_runtime(downloaded_file, track_id);
-        insert_into(schema::downloaded_file::table)
-            .values(&value)
-            .on_conflict(dl::filename)
-            .do_update()
-            .set(dl::track.eq(value.track))
-            .execute(connection)
-            .context("Insert downloaded file")?;
+        let Some(track_id) = value.track else {
+            insert_into(schema::downloaded_file::table)
+                .values(&value)
+                .on_conflict(dl::filename)
+                .do_update()
+                .set(dl::track.eq(value.track))
+                .execute(connection)
+                .context("Insert downloaded file without track")?;
+            return Ok(());
+        };
+        diesel::sql_query(
+            "INSERT INTO downloaded_file (filename, track)
+             VALUES ($1, $2)
+             ON CONFLICT (track) WHERE track IS NOT NULL
+             DO UPDATE SET filename = EXCLUDED.filename",
+        )
+        .bind::<Text, _>(&value.filename)
+        .bind::<Integer, _>(track_id)
+        .execute(connection)
+        .context("Insert downloaded file")?;
         Ok(())
     }
 
@@ -290,7 +303,7 @@ impl<'a> DatabaseManager<'a> {
         self.connection
             .transaction::<_, anyhow::Error, _>(|connection| {
                 match item {
-                    Track::Query(search_item) => {
+                    Track::Query(search_item) | Track::SearchRetry(search_item) => {
                         Self::insert_search_item(connection, search_item)?;
                     }
                     Track::Result(judge_submission) => {

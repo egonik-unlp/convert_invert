@@ -72,6 +72,12 @@ pub struct TrackResponse {
     pub candidates_count: i64,
     #[serde(rename = "rejectReason")]
     pub reject_reason: Option<String>,
+    #[serde(rename = "downloadStatus", skip_serializing_if = "Option::is_none")]
+    pub download_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -159,10 +165,43 @@ struct ExistsRow {
     exists: bool,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct RedisProgress {
     progress: i32,
     finished: bool,
+    status: Option<String>,
+    filename: Option<String>,
+    username: Option<String>,
+    track_db_id: Option<i32>,
+}
+
+fn redis_progress_from_hash(data: &HashMap<String, String>) -> RedisProgress {
+    let finished = data.get("completed").is_some_and(|value| value == "true");
+    let downloaded = data
+        .get("bytes_downloaded")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or_default();
+    let total = data
+        .get("total_bytes")
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or_default();
+    let progress_value = if finished {
+        100
+    } else if total > 0.0 {
+        ((downloaded / total) * 100.0).round() as i32
+    } else {
+        0
+    };
+    RedisProgress {
+        progress: progress_value.clamp(0, 100),
+        finished,
+        status: data.get("status").cloned(),
+        filename: data.get("filename").cloned(),
+        username: data.get("username").cloned(),
+        track_db_id: data
+            .get("track_db_id")
+            .and_then(|value| value.parse::<i32>().ok()),
+    }
 }
 
 fn redis_progress_map(
@@ -192,40 +231,19 @@ fn redis_progress_map(
         let Some(raw_id) = parts.get(1).and_then(|value| value.parse::<i32>().ok()) else {
             continue;
         };
-        let track_id = correlations
-            .get(&raw_id)
-            .copied()
-            .or_else(|| known_ids.contains(&raw_id).then_some(raw_id));
-        let Some(track_id) = track_id else { continue };
-
         let value_type: String = redis::cmd("TYPE").arg(&key).query(&mut redis_con)?;
         if value_type != "hash" {
             continue;
         }
         let data: HashMap<String, String> = redis_con.hgetall(&key)?;
-        let finished = data.get("completed").is_some_and(|value| value == "true");
-        let downloaded = data
-            .get("bytes_downloaded")
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or_default();
-        let total = data
-            .get("total_bytes")
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or_default();
-        let progress_value = if finished {
-            100
-        } else if total > 0.0 {
-            ((downloaded / total) * 100.0).round() as i32
-        } else {
-            0
-        };
-        progress.insert(
-            track_id,
-            RedisProgress {
-                progress: progress_value.clamp(0, 100),
-                finished,
-            },
-        );
+        let redis_progress = redis_progress_from_hash(&data);
+        let track_id = redis_progress
+            .track_db_id
+            .or_else(|| correlations.get(&raw_id).copied())
+            .or_else(|| known_ids.contains(&raw_id).then_some(raw_id));
+        let Some(track_id) = track_id else { continue };
+
+        progress.insert(track_id, redis_progress);
     }
     Ok(progress)
 }
@@ -359,7 +377,12 @@ pub async fn stats(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
     let completed = table_counts.get("downloaded_file").copied().unwrap_or(0);
     let failed = table_counts.get("rejected_track").copied().unwrap_or(0);
     let downloading = redis_progress_map(&state.redis_pool, &state.db_pool)
-        .map(|value| value.len())
+        .map(|value| {
+            value
+                .values()
+                .filter(|redis_progress| !redis_progress.finished)
+                .count()
+        })
         .unwrap_or(0);
     let pending = (total_tracks - completed - failed).max(0);
     let global_progress = if total_tracks > 0 {
@@ -511,10 +534,16 @@ pub async fn playlist(
         .map(|row| {
             let mut track_status = row.track_status;
             let mut progress = if track_status == "COMPLETED" { 100 } else { 0 };
+            let mut download_status = None;
+            let mut filename = None;
+            let mut username = None;
             if track_status != "COMPLETED"
                 && let Some(redis_progress) = progress_map.get(&row.id)
             {
                 progress = redis_progress.progress;
+                download_status = redis_progress.status.clone();
+                filename = redis_progress.filename.clone();
+                username = redis_progress.username.clone();
                 track_status = if redis_progress.finished {
                     "FINALIZING".to_string()
                 } else {
@@ -532,6 +561,9 @@ pub async fn playlist(
                 score: row.max_score,
                 candidates_count: row.candidates_count,
                 reject_reason: format_reject_reason(row.reject_reason, row.reject_value),
+                download_status,
+                filename,
+                username,
             }
         })
         .collect::<Vec<_>>();
@@ -660,37 +692,38 @@ pub async fn downloads(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
     let path = &state.config.download_path;
     let mut files = Vec::new();
 
-    if path.exists() && path.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                let file_path = entry.path();
-                if file_path.is_file() {
-                    let name = file_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
+    if path.exists()
+        && path.is_dir()
+        && let Ok(entries) = std::fs::read_dir(path)
+    {
+        for entry in entries.flatten() {
+            let file_path = entry.path();
+            if file_path.is_file() {
+                let name = file_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
 
-                    if name.starts_with('.') {
-                        continue;
-                    }
-
-                    let metadata = entry.metadata();
-                    let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                    let modified = metadata
-                        .as_ref()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-
-                    files.push(DownloadedFile {
-                        name,
-                        size,
-                        modified,
-                    });
+                if name.starts_with('.') {
+                    continue;
                 }
+
+                let metadata = entry.metadata();
+                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+                let modified = metadata
+                    .as_ref()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+
+                files.push(DownloadedFile {
+                    name,
+                    size,
+                    modified,
+                });
             }
         }
     }
@@ -699,3 +732,46 @@ pub async fn downloads(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
     Ok(HttpResponse::Ok().json(files))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::redis_progress_from_hash;
+    use std::collections::HashMap;
+
+    #[test]
+    fn redis_progress_maps_queued_hash_as_active_zero_percent() {
+        let data = HashMap::from([
+            ("status".to_string(), "queued".to_string()),
+            ("track_db_id".to_string(), "42".to_string()),
+            ("filename".to_string(), "song.flac".to_string()),
+            ("username".to_string(), "peer".to_string()),
+            ("bytes_downloaded".to_string(), "0".to_string()),
+            ("total_bytes".to_string(), "1000".to_string()),
+            ("completed".to_string(), "false".to_string()),
+        ]);
+
+        let progress = redis_progress_from_hash(&data);
+
+        assert_eq!(progress.progress, 0);
+        assert!(!progress.finished);
+        assert_eq!(progress.status.as_deref(), Some("queued"));
+        assert_eq!(progress.track_db_id, Some(42));
+        assert_eq!(progress.filename.as_deref(), Some("song.flac"));
+        assert_eq!(progress.username.as_deref(), Some("peer"));
+    }
+
+    #[test]
+    fn redis_progress_maps_completed_hash_to_done() {
+        let data = HashMap::from([
+            ("status".to_string(), "completed".to_string()),
+            ("bytes_downloaded".to_string(), "100".to_string()),
+            ("total_bytes".to_string(), "100".to_string()),
+            ("completed".to_string(), "true".to_string()),
+        ]);
+
+        let progress = redis_progress_from_hash(&data);
+
+        assert_eq!(progress.progress, 100);
+        assert!(progress.finished);
+        assert_eq!(progress.status.as_deref(), Some("completed"));
+    }
+}

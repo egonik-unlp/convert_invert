@@ -3,7 +3,13 @@ use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
 use std::{
-    collections::HashSet, future::Future, panic::AssertUnwindSafe, path::PathBuf, sync::Arc,
+    any::Any,
+    collections::HashSet,
+    future::Future,
+    net::TcpListener,
+    panic::{AssertUnwindSafe, catch_unwind},
+    path::PathBuf,
+    sync::Arc,
 };
 use tokio::sync::{
     Semaphore,
@@ -15,10 +21,13 @@ use tracing::instrument;
 use anyhow::Context;
 
 use crate::internals::{
+    database::db_pool_snapshot,
     download::download_manager::DownloadManager,
     judge::{judge_manager::JudgeManager, judges::levenshtein::Levenshtein},
     query::query_manager::QueryManager,
-    search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem, SearchManager},
+    search::search_manager::{
+        DownloadableFile, JudgeSubmission, SearchExitReason, SearchItem, SearchManager,
+    },
     utils::config::config_manager::Config,
 };
 
@@ -55,6 +64,8 @@ pub struct RetryRequest {
 pub enum Track {
     /// A new search query to be performed.
     Query(SearchItem),
+    /// A relaxed second-pass search query to be performed.
+    SearchRetry(SearchItem),
     /// A candidate submission found for a track.
     Result(JudgeSubmission),
     /// A candidate that has been judged and is ready for download.
@@ -154,6 +165,7 @@ pub struct Managers {
     pub db_pool: crate::internals::database::DbPool,
     /// The Redis connection pool.
     pub redis_pool: RedisPool,
+    pub search_empty_result_cutoff: usize,
 }
 
 impl Managers {
@@ -164,15 +176,22 @@ impl Managers {
         config: Config,
         db_pool: crate::internals::database::DbPool,
         redis_pool: RedisPool,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
+        let listen_port = config.listen_port;
+        TcpListener::bind(format!("0.0.0.0:{listen_port}"))
+            .with_context(|| format!("listener bind preflight failed on port {listen_port}"))?;
         let client_settings = ClientSettings {
             username: config.user_name,
             password: config.user_password,
-            listen_port: config.listen_port,
+            listen_port,
             ..Default::default()
         };
+        let search_empty_result_cutoff = config.search_empty_result_cutoff;
         let mut client = Client::with_settings(client_settings);
-        client.connect();
+        catch_unwind(AssertUnwindSafe(|| client.connect())).map_err(|payload| {
+            anyhow::anyhow!("listener bind panic: {}", panic_payload(payload))
+        })?;
+        client.login().context("Could not connect")?;
         let client = Arc::new(client);
         let download_manager = DownloadManager::new(client.clone(), path);
         let search_manager = SearchManager::new(client.clone());
@@ -186,7 +205,7 @@ impl Managers {
             config.client_secret,
             config.search_timeout_secs,
         );
-        Managers {
+        Ok(Managers {
             client,
             download_manager,
             search_manager,
@@ -194,34 +213,35 @@ impl Managers {
             query_manager,
             db_pool,
             redis_pool,
-        }
+            search_empty_result_cutoff,
+        })
     }
 
     /// Runs a single chunk of tracks through the search-judge-download pipeline.
     ///
     /// This method orchestrates the task lifecycle using a `JoinSet` and an internal
     /// message channel. It ensures that all spawned tasks are completed before returning.
-    #[instrument(name = "run-cyle", skip(self, tracks))]
-    pub async fn run_cycle(self, tracks: impl IntoIterator<Item = Track>) -> anyhow::Result<()> {
-        let managers = Arc::new(self);
+    #[instrument(name = "run-chunk", skip(self, tracks))]
+    pub async fn run_chunk(
+        self: &Arc<Self>,
+        tracks: impl IntoIterator<Item = Track>,
+    ) -> anyhow::Result<()> {
+        let managers = Arc::clone(self);
         let tuning = WorkerTuning::from_env();
-        let mut conn = managers
-            .db_pool
-            .get()
-            .context("Acquiring DB connection from pool")?;
-        let mut database_manager = DatabaseManager::new(&mut conn);
         let (sender, mut receiver) = mpsc::channel(tuning.queue_capacity);
-
-        managers.client.login().context("Could not connect")?;
 
         let sender = Arc::new(sender);
         let state = Arc::new(tokio::sync::RwLock::new(HashSet::new()));
         let search_semaphore = Arc::new(Semaphore::new(tuning.search_concurrency));
         let download_semaphore = Arc::new(Semaphore::new(tuning.download_concurrency));
+        let snapshot = db_pool_snapshot(&managers.db_pool);
         tracing::info!(
             search_permits = search_semaphore.available_permits(),
             download_permits = download_semaphore.available_permits(),
-            "Started run cycle",
+            db_pool_connections = snapshot.connections,
+            db_pool_idle_connections = snapshot.idle_connections,
+            db_pool_in_use_connections = snapshot.in_use_connections(),
+            "Started run chunk",
         );
         for track in tracks {
             sender.send(track).await.context("injecting tracks")?;
@@ -247,7 +267,7 @@ impl Managers {
                         search_semaphore: &search_semaphore,
                         download_semaphore: &download_semaphore,
                     };
-                    process_track(track, shared, &mut database_manager, &mut tasks).await?;
+                    process_track(track, shared, &mut tasks).await?;
                 }
                 maybe_result = tasks.join_next(), if !tasks.is_empty() => {
                     let task_result = match maybe_result {
@@ -270,15 +290,26 @@ impl Managers {
         if let Some(error) = first_task_error {
             anyhow::bail!(error);
         }
-        tracing::info!("Run cycle finished");
+        let snapshot = db_pool_snapshot(&managers.db_pool);
+        tracing::info!(
+            db_pool_connections = snapshot.connections,
+            db_pool_idle_connections = snapshot.idle_connections,
+            db_pool_in_use_connections = snapshot.in_use_connections(),
+            "Run chunk finished",
+        );
         Ok(())
+    }
+
+    pub fn shutdown(self: Arc<Self>) {
+        tracing::info!(
+            "Managers shutdown requested; soulseek-rs-lib 0.3.0 exposes no public disconnect/logout API",
+        );
     }
 }
 
 async fn process_track(
     track: Track,
     shared: RunCycleShared<'_>,
-    database_manager: &mut DatabaseManager<'_>,
     tasks: &mut JoinSet<ManagedTaskResult>,
 ) -> anyhow::Result<()> {
     let RunCycleShared {
@@ -289,9 +320,23 @@ async fn process_track(
         download_semaphore,
     } = shared;
 
-    database_manager
-        .load_item_to_database(&track)
-        .context("Load into database")?;
+    {
+        let mut conn = managers.db_pool.get().map_err(|err| {
+            let snapshot = db_pool_snapshot(&managers.db_pool);
+            tracing::error!(
+                ?err,
+                db_pool_connections = snapshot.connections,
+                db_pool_idle_connections = snapshot.idle_connections,
+                db_pool_in_use_connections = snapshot.in_use_connections(),
+                "DB pool in process_track"
+            );
+            err
+        })?;
+        let mut database_manager = DatabaseManager::new(&mut conn);
+        database_manager
+            .load_item_to_database(&track)
+            .context("Load into database")?;
+    }
     match track {
         Track::Query(search_item) => {
             let managers = Arc::clone(managers);
@@ -299,17 +344,47 @@ async fn process_track(
             let semaphore = search_semaphore.clone();
             tracing::debug!(?search_item, "Scheduling search");
             spawn_managed(tasks, "search", async move {
-                managers
+                let outcome = managers
                     .search_manager
                     .run(
-                        search_item,
-                        3,
+                        search_item.clone(),
+                        managers.search_empty_result_cutoff(),
                         managers.query_manager_search_timeout(),
+                        false,
+                        semaphore,
+                        Arc::clone(&sender),
+                    )
+                    .await
+                    .context("returning track")?;
+                if matches!(outcome.exit_reason, SearchExitReason::NoCandidatesFound) {
+                    send(Track::SearchRetry(search_item), &sender)
+                        .await
+                        .context("queue relaxed search")?;
+                }
+                Ok(())
+            });
+        }
+        Track::SearchRetry(search_item) => {
+            let managers = Arc::clone(managers);
+            let sender = Arc::clone(sender);
+            let semaphore = search_semaphore.clone();
+            tracing::debug!(?search_item, "Scheduling relaxed search retry");
+            spawn_managed(tasks, "search_retry", async move {
+                let outcome = managers
+                    .search_manager
+                    .run(
+                        search_item.clone(),
+                        managers.search_empty_result_cutoff(),
+                        managers.query_manager_search_timeout(),
+                        true,
                         semaphore,
                         sender,
                     )
                     .await
-                    .context("returning track")?;
+                    .context("returning relaxed track")?;
+                if matches!(outcome.exit_reason, SearchExitReason::NoCandidatesFound) {
+                    tracing::info!(?search_item, "Relaxed search returned no candidates");
+                }
                 Ok(())
             });
         }
@@ -326,10 +401,24 @@ async fn process_track(
             });
         }
         Track::Downloadable(judge_submission) => {
-            if database_manager
-                .is_search_item_downloaded(&judge_submission.track)
-                .context("Check existing downloaded track")?
-            {
+            let is_downloaded = {
+                let mut conn = managers.db_pool.get().map_err(|err| {
+                    let snapshot = db_pool_snapshot(&managers.db_pool);
+                    tracing::error!(
+                        ?err,
+                        db_pool_connections = snapshot.connections,
+                        db_pool_idle_connections = snapshot.idle_connections,
+                        db_pool_in_use_connections = snapshot.in_use_connections(),
+                        "DB pool in downloadable check"
+                    );
+                    err
+                })?;
+                let mut database_manager = DatabaseManager::new(&mut conn);
+                database_manager
+                    .is_search_item_downloaded(&judge_submission.track)
+                    .context("Check existing downloaded track")?
+            };
+            if is_downloaded {
                 let reject =
                     RejectedTrack::new(judge_submission.clone(), RejectReason::AlreadyDownloaded);
                 send(Track::Reject(reject), sender)
@@ -397,8 +486,9 @@ async fn process_track(
                     .search_manager
                     .run(
                         search_item.track,
-                        3,
+                        managers.search_empty_result_cutoff(),
                         managers.query_manager_search_timeout(),
+                        true,
                         semaphore,
                         sender,
                     )
@@ -415,9 +505,23 @@ async fn process_track(
     Ok(())
 }
 
+fn panic_payload(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 impl Managers {
     fn query_manager_search_timeout(&self) -> u8 {
         self.query_manager.search_timeout_secs
+    }
+
+    fn search_empty_result_cutoff(&self) -> usize {
+        self.search_empty_result_cutoff
     }
 }
 

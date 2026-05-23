@@ -5,6 +5,8 @@ use actix_governor::{Governor, GovernorConfigBuilder};
 use actix_web::middleware::from_fn;
 use actix_web::{App, HttpServer, web};
 use anyhow::Context;
+use convert_invert::internals::context::context_manager::WorkerTuning;
+use convert_invert::internals::database::db_pool_max_size_from_env;
 use convert_invert::internals::utils::trace;
 use convert_invert::internals::worker::worker_manager::WorkerSupervisor;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
@@ -42,6 +44,18 @@ async fn main() -> anyhow::Result<()> {
         .context("Tracing")?;
 
     let db_pool = convert_invert::internals::database::init_pool()?;
+    let tuning = WorkerTuning::from_env();
+    let db_pool_max = db_pool_max_size_from_env(18);
+    let minimum_pool = tuning.download_concurrency + tuning.search_concurrency + 2;
+    if db_pool_max < minimum_pool as u32 {
+        tracing::warn!(
+            db_pool_max,
+            minimum_pool,
+            download_concurrency = tuning.download_concurrency,
+            search_concurrency = tuning.search_concurrency,
+            "DB pool max size is below the recommended concurrency floor",
+        );
+    }
     {
         let mut connection = db_pool
             .get()
@@ -53,6 +67,8 @@ async fn main() -> anyhow::Result<()> {
 
     let redis_client = redis::Client::open(app_config.redis_url.as_str())?;
     let redis_pool = diesel::r2d2::Pool::builder()
+        .max_size(env_u32("REDIS_POOL_MAX_SIZE", 18))
+        .connection_timeout(Duration::from_secs(env_u64("REDIS_POOL_TIMEOUT_SECS", 15)))
         .build(redis_client)
         .map_err(|err| anyhow::anyhow!("Failed to create Redis pool: {err}"))?;
 
@@ -151,4 +167,18 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     trace::otel_trace::shutdown_otel();
     Ok(())
+}
+
+fn env_u32(key: &str, default: u32) -> u32 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }

@@ -13,6 +13,7 @@ pub struct Config {
     pub judge_score_llm: Option<f32>,
     pub listen_port: u32,
     pub search_timeout_secs: u8,
+    pub search_empty_result_cutoff: usize,
     pub playlist_id: String,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
@@ -45,8 +46,13 @@ impl Config {
         };
 
         let search_timeout_secs: u8 = {
-            let val = env::var("SEARCH_TIMEOUT_SECS").unwrap_or("10".to_string());
+            let val = env::var("SEARCH_TIMEOUT_SECS").unwrap_or("12".to_string());
             val.parse().context("Cannot parse SEARCH_TIMEOUT_SECS")?
+        };
+        let search_empty_result_cutoff: usize = {
+            let val = env::var("SEARCH_EMPTY_RESULT_CUTOFF").unwrap_or("5".to_string());
+            val.parse()
+                .context("Cannot parse SEARCH_EMPTY_RESULT_CUTOFF")?
         };
         Ok(Config {
             run_id,
@@ -57,6 +63,7 @@ impl Config {
             judge_score_llm,
             listen_port,
             search_timeout_secs,
+            search_empty_result_cutoff,
             playlist_id,
             client_id,
             client_secret,
@@ -72,6 +79,7 @@ impl Config {
         judge_score_llm: Option<f32>,
         listen_port: u32,
         search_timeout_secs: u8,
+        search_empty_result_cutoff: usize,
         run_id: String,
         playlist_id: String,
         client_id: Option<String>,
@@ -86,6 +94,7 @@ impl Config {
             judge_score_llm,
             listen_port,
             search_timeout_secs,
+            search_empty_result_cutoff,
             playlist_id,
             client_id,
             client_secret,

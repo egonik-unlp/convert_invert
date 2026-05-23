@@ -1,14 +1,15 @@
 use crate::internals::{
     context::context_manager::{
-        DownloadedFile, RejectReason, RejectedTrack, RetryRequest, Track, send,
+        DownloadedFile, RedisPool, RejectReason, RejectedTrack, RetryRequest, Track, send,
     },
+    database::db_pool_snapshot,
     database::manager::DatabaseManager,
     search::search_manager::JudgeSubmission,
 };
 use anyhow::Context;
 use redis::TypedCommands;
 use soulseek_rs::{Client, DownloadStatus};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{path::PathBuf, str::FromStr, sync::Arc};
 use tokio::{
     sync::{Semaphore, mpsc::Sender},
@@ -44,7 +45,9 @@ impl DownloadManager {
         let download_location = self.root_location.clone();
         let id = track.track.track_id.clone();
         let is_banned = {
-            let mut redis_con = redis_pool.get().context("Redis pool in run")?;
+            let mut redis_con = redis_pool
+                .get_timeout(Duration::from_secs(5))
+                .context("Redis pool in run")?;
             redis_con.sismember::<_, _>("ban-list", id).unwrap_or(false)
         };
         if is_audio_file(track.query.filename.clone()) && !is_banned {
@@ -77,6 +80,56 @@ impl DownloadManager {
         }
         Ok(())
     }
+}
+
+struct ProgressUpdate {
+    status: &'static str,
+    track_db_id: i32,
+    judge_submission_id: i32,
+    filename: String,
+    username: String,
+    bytes_downloaded: u64,
+    total_bytes: u64,
+    speed_bytes_per_sec: f64,
+    completed: bool,
+}
+
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn write_progress(redis_pool: &RedisPool, key: &str, update: ProgressUpdate) -> anyhow::Result<()> {
+    let mut redis_con = redis_pool
+        .get_timeout(Duration::from_secs(5))
+        .context("Redis pool in download progress write")?;
+    let values = [
+        ("status".to_string(), update.status.to_string()),
+        ("track_db_id".to_string(), update.track_db_id.to_string()),
+        (
+            "judge_submission_id".to_string(),
+            update.judge_submission_id.to_string(),
+        ),
+        ("filename".to_string(), update.filename),
+        ("username".to_string(), update.username),
+        (
+            "bytes_downloaded".to_string(),
+            update.bytes_downloaded.to_string(),
+        ),
+        ("total_bytes".to_string(), update.total_bytes.to_string()),
+        (
+            "speed_bytes_per_sec".to_string(),
+            update.speed_bytes_per_sec.to_string(),
+        ),
+        ("completed".to_string(), update.completed.to_string()),
+        ("updated_at".to_string(), unix_timestamp_secs().to_string()),
+    ];
+    redis_con
+        .hset_multiple::<String, String, _>(key.to_string(), &values)
+        .context("Write Redis download progress")?;
+    Ok(())
 }
 
 #[tracing::instrument(name = "DownloadManager::download_track", skip(song, path, client, redis_pool, db_pool ), fields(
@@ -114,17 +167,60 @@ async fn download_track(
     let log_every = Duration::from_secs(10);
     let download_handle: JoinHandle<anyhow::Result<Track>> =
         tokio::task::spawn_blocking(move || {
-            let mut conn = db_pool
-                .get_timeout(Duration::from_secs(5))
-                .context("DB pool in download_track")?;
-            let mut redis_con = redis_pool
-                .get_timeout(Duration::from_secs(5))
-                .context("Redis pool in download_track")?;
-            let track_id = DatabaseManager::get_judge_submission_id(&mut conn, &song)
-                .context("Getting js id in download")?;
-            let key = format!("dl:{track_id}:progress");
+            let (judge_submission_id, track_db_id) = {
+                let mut conn = db_pool
+                    .get_timeout(Duration::from_secs(15))
+                    .map_err(|err| {
+                        let snapshot = db_pool_snapshot(&db_pool);
+                        tracing::error!(
+                            ?err,
+                            db_pool_connections = snapshot.connections,
+                            db_pool_idle_connections = snapshot.idle_connections,
+                            db_pool_in_use_connections = snapshot.in_use_connections(),
+                            "DB pool in download_track"
+                        );
+                        err
+                    })?;
+                let judge_submission_id =
+                    DatabaseManager::get_judge_submission_id(&mut conn, &song)
+                        .context("Getting js id in download")?;
+                let track_db_id = DatabaseManager::get_search_item_id(&mut conn, &song.track)
+                    .context("Getting track id in download")?;
+                (judge_submission_id, track_db_id)
+            };
+            let key = format!("dl:{judge_submission_id}:progress");
+            write_progress(
+                &redis_pool,
+                &key,
+                ProgressUpdate {
+                    status: "queued",
+                    track_db_id,
+                    judge_submission_id,
+                    filename: song.query.filename.clone(),
+                    username: song.query.username.clone(),
+                    bytes_downloaded: 0,
+                    total_bytes: u64::try_from(song.query.size).unwrap_or_default(),
+                    speed_bytes_per_sec: 0.0,
+                    completed: false,
+                },
+            )?;
             let track = loop {
                 if started.elapsed() > hard_deadline {
+                    write_progress(
+                        &redis_pool,
+                        &key,
+                        ProgressUpdate {
+                            status: "retrying",
+                            track_db_id,
+                            judge_submission_id,
+                            filename: song.query.filename.clone(),
+                            username: song.query.username.clone(),
+                            bytes_downloaded: last_bytes,
+                            total_bytes: u64::try_from(song.query.size).unwrap_or_default(),
+                            speed_bytes_per_sec: 0.0,
+                            completed: false,
+                        },
+                    )?;
                     let retry_request = RetryRequest {
                         request: song.clone(),
                         retry_attempts: 0,
@@ -136,7 +232,37 @@ async fn download_track(
                 match status {
                     Ok(DownloadStatus::Queued) => {
                         let qs = queued_since.get_or_insert(Instant::now());
+                        write_progress(
+                            &redis_pool,
+                            &key,
+                            ProgressUpdate {
+                                status: "queued",
+                                track_db_id,
+                                judge_submission_id,
+                                filename: song.query.filename.clone(),
+                                username: song.query.username.clone(),
+                                bytes_downloaded: last_bytes,
+                                total_bytes: u64::try_from(song.query.size).unwrap_or_default(),
+                                speed_bytes_per_sec: 0.0,
+                                completed: false,
+                            },
+                        )?;
                         if qs.elapsed() > max_queued {
+                            write_progress(
+                                &redis_pool,
+                                &key,
+                                ProgressUpdate {
+                                    status: "retrying",
+                                    track_db_id,
+                                    judge_submission_id,
+                                    filename: song.query.filename.clone(),
+                                    username: song.query.username.clone(),
+                                    bytes_downloaded: last_bytes,
+                                    total_bytes: u64::try_from(song.query.size).unwrap_or_default(),
+                                    speed_bytes_per_sec: 0.0,
+                                    completed: false,
+                                },
+                            )?;
                             let retry_request = RetryRequest {
                                 request: song.clone(),
                                 failed_download_result: song.clone().query,
@@ -160,6 +286,21 @@ async fn download_track(
                             last_bytes = bytes_downloaded;
                             last_progress = Instant::now();
                         } else if last_progress.elapsed() > max_no_progress {
+                            write_progress(
+                                &redis_pool,
+                                &key,
+                                ProgressUpdate {
+                                    status: "retrying",
+                                    track_db_id,
+                                    judge_submission_id,
+                                    filename: song.query.filename.clone(),
+                                    username: song.query.username.clone(),
+                                    bytes_downloaded: last_bytes,
+                                    total_bytes,
+                                    speed_bytes_per_sec: 0.0,
+                                    completed: false,
+                                },
+                            )?;
                             let retry_request = RetryRequest {
                                 request: song.clone(),
                                 failed_download_result: song.clone().query,
@@ -178,26 +319,39 @@ async fn download_track(
                             last_log = Instant::now();
                         }
 
-                        let values = [
-                            (
-                                "bytes_downloaded".to_string(),
-                                format!("{bytes_downloaded}"),
-                            ),
-                            ("total_bytes".to_string(), format!("{total_bytes}")),
-                            (
-                                "speed_bytes_per_sec".to_string(),
-                                format!("{speed_bytes_per_sec}"),
-                            ),
-                        ];
-                        redis_con
-                            .hset_multiple::<String, String, _>(key.clone(), &values)
-                            .context("Write Redis download progress")?;
+                        write_progress(
+                            &redis_pool,
+                            &key,
+                            ProgressUpdate {
+                                status: "in_progress",
+                                track_db_id,
+                                judge_submission_id,
+                                filename: song.query.filename.clone(),
+                                username: song.query.username.clone(),
+                                bytes_downloaded,
+                                total_bytes,
+                                speed_bytes_per_sec,
+                                completed: false,
+                            },
+                        )?;
                         continue;
                     }
                     Ok(DownloadStatus::Completed) => {
-                        redis_con
-                            .hset(key.clone(), "completed".to_string(), format!("{}", true))
-                            .context("Mark Redis download completed")?;
+                        write_progress(
+                            &redis_pool,
+                            &key,
+                            ProgressUpdate {
+                                status: "completed",
+                                track_db_id,
+                                judge_submission_id,
+                                filename: song.query.filename.clone(),
+                                username: song.query.username.clone(),
+                                bytes_downloaded: last_bytes,
+                                total_bytes: u64::try_from(song.query.size).unwrap_or_default(),
+                                speed_bytes_per_sec: 0.0,
+                                completed: true,
+                            },
+                        )?;
                         break Track::File(DownloadedFile {
                             filename: song.query.filename,
                             track: song.track,
@@ -205,6 +359,21 @@ async fn download_track(
                     }
                     Ok(DownloadStatus::Failed | DownloadStatus::TimedOut) => {
                         tracing::error!(?song, "Download failed or timed out");
+                        write_progress(
+                            &redis_pool,
+                            &key,
+                            ProgressUpdate {
+                                status: "retrying",
+                                track_db_id,
+                                judge_submission_id,
+                                filename: song.query.filename.clone(),
+                                username: song.query.username.clone(),
+                                bytes_downloaded: last_bytes,
+                                total_bytes: u64::try_from(song.query.size).unwrap_or_default(),
+                                speed_bytes_per_sec: 0.0,
+                                completed: false,
+                            },
+                        )?;
                         break Track::Retry(RetryRequest {
                             request: song.clone(),
                             retry_attempts: 0,
@@ -214,6 +383,21 @@ async fn download_track(
                     Err(retry_or_tout) => {
                         tracing::warn!(?retry_or_tout, "Download status receive error");
                         if last_progress.elapsed() > max_no_progress {
+                            write_progress(
+                                &redis_pool,
+                                &key,
+                                ProgressUpdate {
+                                    status: "retrying",
+                                    track_db_id,
+                                    judge_submission_id,
+                                    filename: song.query.filename.clone(),
+                                    username: song.query.username.clone(),
+                                    bytes_downloaded: last_bytes,
+                                    total_bytes: u64::try_from(song.query.size).unwrap_or_default(),
+                                    speed_bytes_per_sec: 0.0,
+                                    completed: false,
+                                },
+                            )?;
                             let retry_request = RetryRequest {
                                 request: song.clone(),
                                 failed_download_result: song.clone().query,
