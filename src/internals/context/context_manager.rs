@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
 use std::{
     any::Any,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     future::Future,
     net::TcpListener,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -46,9 +46,36 @@ struct ManagedTaskResult {
 struct RunCycleShared<'a> {
     managers: &'a Arc<Managers>,
     sender: &'a Arc<Sender<Track>>,
-    state: &'a Arc<tokio::sync::RwLock<HashSet<SearchItem>>>,
+    state: &'a Arc<tokio::sync::RwLock<RunState>>,
     search_semaphore: &'a Arc<Semaphore>,
     download_semaphore: &'a Arc<Semaphore>,
+}
+
+#[derive(Debug, Default)]
+struct RunState {
+    in_progress: HashSet<SearchItem>,
+    candidate_pools: HashMap<SearchItem, CandidatePool>,
+    request_budgets: HashMap<SearchItem, RequestBudget>,
+}
+
+#[derive(Debug, Default)]
+struct CandidatePool {
+    candidates: Vec<JudgeSubmission>,
+    failed: HashSet<DownloadableFile>,
+    attempts: usize,
+    selection_queued: bool,
+}
+
+#[derive(Debug, Default)]
+struct RequestBudget {
+    request_count: usize,
+    search_passes: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RequestKind {
+    Search,
+    Download,
 }
 
 /// A request to retry a failed search or download.
@@ -70,6 +97,8 @@ pub enum Track {
     Result(JudgeSubmission),
     /// A candidate that has been judged and is ready for download.
     Downloadable(JudgeSubmission),
+    /// Internal signal to select the best accepted candidate after a short collection window.
+    SelectCandidate(SearchItem),
     /// A file that has been successfully downloaded.
     File(DownloadedFile),
     /// A request to retry a failed operation.
@@ -129,20 +158,42 @@ pub struct WorkerTuning {
     pub download_concurrency: usize,
     /// Capacity of the work-distribution channel.
     pub queue_capacity: usize,
+    /// Number of accepted candidates retained per track.
+    pub max_candidates_per_track: usize,
+    /// Max candidate download attempts before falling back to a relaxed search/rejection.
+    pub max_download_attempts_per_track: usize,
+    /// Seconds to wait for more accepted candidates before the first download attempt.
+    pub candidate_collection_secs: u64,
+    /// Max original/relaxed search passes per track.
+    pub max_search_passes_per_track: usize,
+    /// Max total Soulseek search/download requests per track.
+    pub max_requests_per_track: usize,
 }
 
 impl WorkerTuning {
     /// Loads tuning parameters from environment variables with sensible defaults.
     pub fn from_env() -> Self {
         Self {
-            search_concurrency: env_usize("SEARCH_CONCURRENCY", 4),
-            download_concurrency: env_usize("DOWNLOAD_CONCURRENCY", 7),
+            search_concurrency: env_usize("SEARCH_CONCURRENCY", 1),
+            download_concurrency: env_usize("DOWNLOAD_CONCURRENCY", 1),
             queue_capacity: env_usize("QUEUE_CAPACITY", 20000),
+            max_candidates_per_track: env_usize("MAX_CANDIDATES_PER_TRACK", 3).max(1),
+            max_download_attempts_per_track: env_usize("MAX_DOWNLOAD_ATTEMPTS_PER_TRACK", 2).max(1),
+            candidate_collection_secs: env_u64("CANDIDATE_COLLECTION_SECS", 20),
+            max_search_passes_per_track: env_usize("MAX_SEARCH_PASSES_PER_TRACK", 2).max(1),
+            max_requests_per_track: env_usize("MAX_REQUESTS_PER_TRACK", 8).max(1),
         }
     }
 }
 
 fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|value| value.parse().ok())
@@ -231,13 +282,18 @@ impl Managers {
         let (sender, mut receiver) = mpsc::channel(tuning.queue_capacity);
 
         let sender = Arc::new(sender);
-        let state = Arc::new(tokio::sync::RwLock::new(HashSet::new()));
+        let state = Arc::new(tokio::sync::RwLock::new(RunState::default()));
         let search_semaphore = Arc::new(Semaphore::new(tuning.search_concurrency));
         let download_semaphore = Arc::new(Semaphore::new(tuning.download_concurrency));
         let snapshot = db_pool_snapshot(&managers.db_pool);
         tracing::info!(
             search_permits = search_semaphore.available_permits(),
             download_permits = download_semaphore.available_permits(),
+            max_candidates_per_track = tuning.max_candidates_per_track,
+            max_download_attempts_per_track = tuning.max_download_attempts_per_track,
+            candidate_collection_secs = tuning.candidate_collection_secs,
+            max_search_passes_per_track = tuning.max_search_passes_per_track,
+            max_requests_per_track = tuning.max_requests_per_track,
             db_pool_connections = snapshot.connections,
             db_pool_idle_connections = snapshot.idle_connections,
             db_pool_in_use_connections = snapshot.in_use_connections(),
@@ -320,7 +376,7 @@ async fn process_track(
         download_semaphore,
     } = shared;
 
-    {
+    if !matches!(track, Track::SelectCandidate(_)) {
         let mut conn = managers.db_pool.get().map_err(|err| {
             let snapshot = db_pool_snapshot(&managers.db_pool);
             tracing::error!(
@@ -339,6 +395,20 @@ async fn process_track(
     }
     match track {
         Track::Query(search_item) => {
+            let tuning = WorkerTuning::from_env();
+            let request_allowed = {
+                let mut state_guard = state.write().await;
+                spend_request(&mut state_guard, &search_item, &tuning, RequestKind::Search)
+            };
+            if !request_allowed {
+                tracing::info!(
+                    track_id = %search_item.track_id,
+                    max_search_passes_per_track = tuning.max_search_passes_per_track,
+                    max_requests_per_track = tuning.max_requests_per_track,
+                    "Request budget exhausted before initial search",
+                );
+                return Ok(());
+            }
             let managers = Arc::clone(managers);
             let sender = Arc::clone(sender);
             let semaphore = search_semaphore.clone();
@@ -365,6 +435,20 @@ async fn process_track(
             });
         }
         Track::SearchRetry(search_item) => {
+            let tuning = WorkerTuning::from_env();
+            let request_allowed = {
+                let mut state_guard = state.write().await;
+                spend_request(&mut state_guard, &search_item, &tuning, RequestKind::Search)
+            };
+            if !request_allowed {
+                tracing::info!(
+                    track_id = %search_item.track_id,
+                    max_search_passes_per_track = tuning.max_search_passes_per_track,
+                    max_requests_per_track = tuning.max_requests_per_track,
+                    "Request budget exhausted before relaxed search",
+                );
+                return Ok(());
+            }
             let managers = Arc::clone(managers);
             let sender = Arc::clone(sender);
             let semaphore = search_semaphore.clone();
@@ -426,45 +510,132 @@ async fn process_track(
                     .context("sending already downloaded rejection")?;
                 return Ok(());
             }
-            let semaphore = download_semaphore.clone();
-            let managers = Arc::clone(managers);
-            tracing::debug!(?judge_submission, "Scheduling download");
-            let judge_sub = judge_submission.clone();
-            let sender = Arc::clone(sender);
-
+            let tuning = WorkerTuning::from_env();
             let mut state_guard = state.write().await;
-            if state_guard.insert(judge_submission.track.clone()) {
-                drop(state_guard);
-
-                let managers_clone = Arc::clone(&managers);
-                spawn_managed(tasks, "download", async move {
-                    managers_clone
-                        .download_manager
-                        .run(
-                            judge_sub,
-                            semaphore,
-                            sender,
-                            managers_clone.redis_pool.clone(),
-                            managers_clone.db_pool.clone(),
-                        )
+            let pool = state_guard
+                .candidate_pools
+                .entry(judge_submission.track.clone())
+                .or_default();
+            push_candidate(
+                pool,
+                judge_submission.clone(),
+                tuning.max_candidates_per_track,
+            );
+            tracing::debug!(
+                track_id = %judge_submission.track.track_id,
+                candidates = pool.candidates.len(),
+                "Accepted candidate queued",
+            );
+            if !pool.selection_queued {
+                pool.selection_queued = true;
+                let search_item = judge_submission.track.clone();
+                let sender = Arc::clone(sender);
+                spawn_managed(tasks, "candidate_collection", async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        tuning.candidate_collection_secs,
+                    ))
+                    .await;
+                    send(Track::SelectCandidate(search_item), &sender)
                         .await
-                        .context("Downloading")?;
-                    Ok(())
+                        .context("queue candidate selection")
                 });
-            } else {
-                drop(state_guard);
-                let reject =
-                    RejectedTrack::new(judge_submission.clone(), RejectReason::AlreadyDownloaded);
-                send(Track::Reject(reject), &sender)
-                    .await
-                    .context("sending rejected_tracks")?;
+            }
+        }
+        Track::SelectCandidate(search_item) => {
+            let tuning = WorkerTuning::from_env();
+            let selection = {
+                let mut state_guard = state.write().await;
+                select_candidate(&mut state_guard, &search_item, &tuning)
+            };
+            match selection {
+                CandidateSelection::Download(judge_submission) => {
+                    schedule_download(
+                        tasks,
+                        managers,
+                        download_semaphore.clone(),
+                        Arc::clone(sender),
+                        judge_submission,
+                        "download",
+                    );
+                }
+                CandidateSelection::RetrySearch => {
+                    schedule_relaxed_search(
+                        tasks,
+                        state,
+                        managers,
+                        search_semaphore.clone(),
+                        Arc::clone(sender),
+                        search_item,
+                        "retry_search",
+                    )
+                    .await;
+                }
+                CandidateSelection::Reject(judge_submission) => {
+                    let reject = RejectedTrack::new(
+                        judge_submission,
+                        RejectReason::AbandonedAttemptingSearch,
+                    );
+                    send(Track::Reject(reject), sender)
+                        .await
+                        .context("rejecting exhausted candidates")?;
+                }
+                CandidateSelection::Wait | CandidateSelection::None => {}
             }
         }
         Track::File(downloaded_file) => {
+            state
+                .write()
+                .await
+                .in_progress
+                .remove(&downloaded_file.track);
             tracing::info!(?downloaded_file, "Downloaded file");
         }
         Track::Retry(mut retry_request) => {
-            state.write().await.remove(&retry_request.request.track);
+            let tuning = WorkerTuning::from_env();
+            let next_selection = {
+                let mut state_guard = state.write().await;
+                state_guard.in_progress.remove(&retry_request.request.track);
+                if let Some(pool) = state_guard
+                    .candidate_pools
+                    .get_mut(&retry_request.request.track)
+                {
+                    pool.failed
+                        .insert(retry_request.failed_download_result.clone());
+                }
+                select_candidate(&mut state_guard, &retry_request.request.track, &tuning)
+            };
+            match next_selection {
+                CandidateSelection::Download(judge_submission) => {
+                    tracing::info!(
+                        ?retry_request.request,
+                        ?judge_submission,
+                        "Retrying with alternate candidate",
+                    );
+                    schedule_download(
+                        tasks,
+                        managers,
+                        download_semaphore.clone(),
+                        Arc::clone(sender),
+                        judge_submission,
+                        "download_retry",
+                    );
+                    retry_request.retry_attempts += 1;
+                    tracing::debug!(?retry_request, "Alternate retry queued");
+                    return Ok(());
+                }
+                CandidateSelection::Reject(judge_submission) => {
+                    let reject = RejectedTrack::new(
+                        judge_submission,
+                        RejectReason::AbandonedAttemptingSearch,
+                    );
+                    send(Track::Reject(reject), sender)
+                        .await
+                        .context("rejecting exhausted candidates")?;
+                    return Ok(());
+                }
+                CandidateSelection::Wait => return Ok(()),
+                CandidateSelection::RetrySearch | CandidateSelection::None => {}
+            }
             if retry_request.retry_attempts >= 1 {
                 let reject = RejectedTrack::new(
                     retry_request.request,
@@ -481,28 +652,218 @@ async fn process_track(
             let sender = Arc::clone(sender);
             tracing::info!(?retry_request.request, "Retry requested");
             let search_item = retry_request.request.clone();
-            spawn_managed(tasks, "retry_search", async move {
-                managers
-                    .search_manager
-                    .run(
-                        search_item.track,
-                        managers.search_empty_result_cutoff(),
-                        managers.query_manager_search_timeout(),
-                        true,
-                        semaphore,
-                        sender,
-                    )
-                    .await
-                    .context("returning track")?;
-                Ok(())
-            });
+            schedule_relaxed_search(
+                tasks,
+                state,
+                &managers,
+                semaphore,
+                sender,
+                search_item.track,
+                "retry_search",
+            )
+            .await;
             tracing::debug!(?retry_request, "Retry queued")
         }
         Track::Reject(rejected_track) => {
-            state.write().await.remove(&rejected_track.track.track);
+            state
+                .write()
+                .await
+                .in_progress
+                .remove(&rejected_track.track.track);
         }
     }
     Ok(())
+}
+
+enum CandidateSelection {
+    Download(JudgeSubmission),
+    RetrySearch,
+    Reject(JudgeSubmission),
+    Wait,
+    None,
+}
+
+fn schedule_download(
+    tasks: &mut JoinSet<ManagedTaskResult>,
+    managers: &Arc<Managers>,
+    semaphore: Arc<Semaphore>,
+    sender: Arc<Sender<Track>>,
+    judge_submission: JudgeSubmission,
+    label: &'static str,
+) {
+    let managers = Arc::clone(managers);
+    tracing::debug!(?judge_submission, task_label = label, "Scheduling download");
+    spawn_managed(tasks, label, async move {
+        managers
+            .download_manager
+            .run(
+                judge_submission,
+                semaphore,
+                sender,
+                managers.redis_pool.clone(),
+                managers.db_pool.clone(),
+            )
+            .await
+            .context("Downloading")?;
+        Ok(())
+    });
+}
+
+async fn schedule_relaxed_search(
+    tasks: &mut JoinSet<ManagedTaskResult>,
+    state: &Arc<tokio::sync::RwLock<RunState>>,
+    managers: &Arc<Managers>,
+    semaphore: Arc<Semaphore>,
+    sender: Arc<Sender<Track>>,
+    search_item: SearchItem,
+    label: &'static str,
+) {
+    let tuning = WorkerTuning::from_env();
+    let request_allowed = {
+        let mut state_guard = state.write().await;
+        spend_request(&mut state_guard, &search_item, &tuning, RequestKind::Search)
+    };
+    if !request_allowed {
+        tracing::info!(
+            track_id = %search_item.track_id,
+            max_search_passes_per_track = tuning.max_search_passes_per_track,
+            max_requests_per_track = tuning.max_requests_per_track,
+            "Request budget exhausted before relaxed search",
+        );
+        return;
+    }
+    let managers = Arc::clone(managers);
+    tracing::info!(?search_item, "Scheduling relaxed retry search");
+    spawn_managed(tasks, label, async move {
+        managers
+            .search_manager
+            .run(
+                search_item,
+                managers.search_empty_result_cutoff(),
+                managers.query_manager_search_timeout(),
+                true,
+                semaphore,
+                sender,
+            )
+            .await
+            .context("returning track")?;
+        Ok(())
+    });
+}
+
+fn spend_request(
+    state: &mut RunState,
+    search_item: &SearchItem,
+    tuning: &WorkerTuning,
+    kind: RequestKind,
+) -> bool {
+    let budget = state
+        .request_budgets
+        .entry(search_item.clone())
+        .or_default();
+    if budget.request_count >= tuning.max_requests_per_track {
+        return false;
+    }
+    if matches!(kind, RequestKind::Search) {
+        if budget.search_passes >= tuning.max_search_passes_per_track {
+            return false;
+        }
+        budget.search_passes += 1;
+    }
+    budget.request_count += 1;
+    true
+}
+
+fn push_candidate(pool: &mut CandidatePool, candidate: JudgeSubmission, limit: usize) {
+    if pool
+        .candidates
+        .iter()
+        .any(|existing| existing.query == candidate.query)
+    {
+        return;
+    }
+    pool.candidates.push(candidate);
+    pool.candidates.sort_by(compare_candidates);
+    pool.candidates.truncate(limit);
+}
+
+fn select_candidate(
+    state: &mut RunState,
+    search_item: &SearchItem,
+    tuning: &WorkerTuning,
+) -> CandidateSelection {
+    if state.in_progress.contains(search_item) {
+        return CandidateSelection::Wait;
+    }
+    let candidate = {
+        let Some(pool) = state.candidate_pools.get_mut(search_item) else {
+            return CandidateSelection::None;
+        };
+        pool.selection_queued = false;
+        let candidate = pool
+            .candidates
+            .iter()
+            .find(|candidate| !pool.failed.contains(&candidate.query))
+            .cloned();
+        if let Some(candidate) = candidate {
+            if pool.attempts >= tuning.max_download_attempts_per_track {
+                return CandidateSelection::Reject(candidate);
+            }
+            Some(candidate)
+        } else {
+            if pool.attempts >= tuning.max_download_attempts_per_track {
+                return pool
+                    .candidates
+                    .first()
+                    .cloned()
+                    .map(CandidateSelection::Reject)
+                    .unwrap_or(CandidateSelection::None);
+            }
+            None
+        }
+    };
+    if let Some(candidate) = candidate {
+        if !spend_request(state, search_item, tuning, RequestKind::Download) {
+            tracing::info!(
+                track_id = %search_item.track_id,
+                max_requests_per_track = tuning.max_requests_per_track,
+                "Request budget exhausted before download attempt",
+            );
+            return CandidateSelection::Reject(candidate);
+        }
+        let pool = state
+            .candidate_pools
+            .get_mut(search_item)
+            .expect("candidate pool exists after selecting candidate");
+        pool.attempts += 1;
+        state.in_progress.insert(search_item.clone());
+        return CandidateSelection::Download(candidate);
+    }
+    CandidateSelection::RetrySearch
+}
+
+fn compare_candidates(left: &JudgeSubmission, right: &JudgeSubmission) -> std::cmp::Ordering {
+    right
+        .score
+        .partial_cmp(&left.score)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then_with(|| quality_rank(&right.query.filename).cmp(&quality_rank(&left.query.filename)))
+        .then_with(|| right.query.size.cmp(&left.query.size))
+}
+
+fn quality_rank(filename: &str) -> u8 {
+    let lower = filename.to_ascii_lowercase();
+    if lower.ends_with(".flac") {
+        4
+    } else if lower.ends_with(".wav") || lower.ends_with(".aiff") || lower.ends_with(".aif") {
+        3
+    } else if lower.ends_with(".mp3") {
+        2
+    } else if lower.ends_with(".aac") || lower.ends_with(".m4a") || lower.ends_with(".ogg") {
+        1
+    } else {
+        0
+    }
 }
 
 fn panic_payload(payload: Box<dyn Any + Send>) -> String {
@@ -542,7 +903,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{ManagedTaskResult, spawn_managed};
+    use super::{
+        CandidatePool, CandidateSelection, ManagedTaskResult, RequestKind, RunState, WorkerTuning,
+        push_candidate, select_candidate, spawn_managed, spend_request,
+    };
+    use crate::internals::search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem};
     use tokio::task::JoinSet;
 
     async fn next_result(tasks: &mut JoinSet<ManagedTaskResult>) -> ManagedTaskResult {
@@ -562,6 +927,139 @@ mod tests {
         let result = next_result(&mut tasks).await;
         assert_eq!(result.label, "search");
         assert!(result.error.is_none());
+    }
+
+    fn item() -> SearchItem {
+        SearchItem::new(
+            "spotify-track-id".to_string(),
+            "Track".to_string(),
+            "Album".to_string(),
+            "Artist".to_string(),
+        )
+    }
+
+    fn submission(filename: &str, score: f32, size: i64) -> JudgeSubmission {
+        JudgeSubmission {
+            track: item(),
+            query: DownloadableFile {
+                filename: filename.to_string(),
+                username: format!("user-{filename}"),
+                size,
+            },
+            score: Some(score),
+        }
+    }
+
+    fn tuning(max_attempts: usize) -> WorkerTuning {
+        WorkerTuning {
+            search_concurrency: 1,
+            download_concurrency: 1,
+            queue_capacity: 10,
+            max_candidates_per_track: 5,
+            max_download_attempts_per_track: max_attempts,
+            candidate_collection_secs: 0,
+            max_search_passes_per_track: 2,
+            max_requests_per_track: 8,
+        }
+    }
+
+    #[test]
+    fn candidate_pool_prefers_score_then_quality() {
+        let mut pool = CandidatePool::default();
+
+        push_candidate(&mut pool, submission("song.mp3", 0.8, 10), 5);
+        push_candidate(&mut pool, submission("song.flac", 0.8, 20), 5);
+        push_candidate(&mut pool, submission("lower.flac", 0.7, 30), 5);
+
+        assert_eq!(pool.candidates[0].query.filename, "song.flac");
+        assert_eq!(pool.candidates[1].query.filename, "song.mp3");
+        assert_eq!(pool.candidates[2].query.filename, "lower.flac");
+    }
+
+    #[test]
+    fn selection_skips_failed_candidate_before_retrying_search() {
+        let search_item = item();
+        let first = submission("first.flac", 0.9, 10);
+        let second = submission("second.flac", 0.8, 10);
+        let mut state = RunState::default();
+        let pool = state
+            .candidate_pools
+            .entry(search_item.clone())
+            .or_default();
+        push_candidate(pool, first.clone(), 5);
+        push_candidate(pool, second.clone(), 5);
+
+        match select_candidate(&mut state, &search_item, &tuning(5)) {
+            CandidateSelection::Download(candidate) => assert_eq!(candidate.query, first.query),
+            _ => panic!("expected first download"),
+        }
+        state.in_progress.remove(&search_item);
+        state
+            .candidate_pools
+            .get_mut(&search_item)
+            .expect("pool")
+            .failed
+            .insert(first.query);
+
+        match select_candidate(&mut state, &search_item, &tuning(5)) {
+            CandidateSelection::Download(candidate) => assert_eq!(candidate.query, second.query),
+            _ => panic!("expected alternate download"),
+        }
+    }
+
+    #[test]
+    fn selection_rejects_after_attempt_limit() {
+        let search_item = item();
+        let mut state = RunState::default();
+        let pool = state
+            .candidate_pools
+            .entry(search_item.clone())
+            .or_default();
+        push_candidate(pool, submission("only.flac", 0.9, 10), 5);
+        pool.attempts = 1;
+
+        match select_candidate(&mut state, &search_item, &tuning(1)) {
+            CandidateSelection::Reject(candidate) => {
+                assert_eq!(candidate.query.filename, "only.flac");
+            }
+            _ => panic!("expected rejection"),
+        }
+    }
+
+    #[test]
+    fn request_budget_caps_search_passes_and_total_requests() {
+        let search_item = item();
+        let mut state = RunState::default();
+        let tuning = WorkerTuning {
+            max_search_passes_per_track: 1,
+            max_requests_per_track: 2,
+            ..tuning(5)
+        };
+
+        assert!(spend_request(
+            &mut state,
+            &search_item,
+            &tuning,
+            RequestKind::Search
+        ));
+        assert!(!spend_request(
+            &mut state,
+            &search_item,
+            &tuning,
+            RequestKind::Search
+        ));
+        assert!(spend_request(
+            &mut state,
+            &search_item,
+            &tuning,
+            RequestKind::Download
+        ));
+        assert!(!spend_request(
+            &mut state,
+            &search_item,
+            &tuning,
+            RequestKind::Download
+        ));
     }
 
     #[tokio::test]

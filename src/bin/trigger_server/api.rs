@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use actix_web::{HttpResponse, get, web};
 use convert_invert::internals::context::context_manager::RedisPool;
+use convert_invert::internals::context::context_manager::WorkerTuning;
 use convert_invert::internals::database::DbPool;
 use convert_invert::internals::database::schema;
 use convert_invert::internals::judge::judge_manager::JUDGE_THRESHOLD;
@@ -113,12 +114,43 @@ pub struct ConfigResponse {
     #[serde(rename = "judgeThreshold")]
     pub judge_threshold: f32,
     pub auth: AuthConfig,
+    pub tuning: TuningConfig,
 }
 
 #[derive(Serialize)]
 pub struct AuthConfig {
     pub scheme: &'static str,
     pub header: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct TuningConfig {
+    #[serde(rename = "searchConcurrency")]
+    pub search_concurrency: usize,
+    #[serde(rename = "downloadConcurrency")]
+    pub download_concurrency: usize,
+    #[serde(rename = "searchTimeoutSecs")]
+    pub search_timeout_secs: u8,
+    #[serde(rename = "searchEmptyResultCutoff")]
+    pub search_empty_result_cutoff: usize,
+    #[serde(rename = "maxCandidatesPerTrack")]
+    pub max_candidates_per_track: usize,
+    #[serde(rename = "maxDownloadAttemptsPerTrack")]
+    pub max_download_attempts_per_track: usize,
+    #[serde(rename = "candidateCollectionSecs")]
+    pub candidate_collection_secs: u64,
+    #[serde(rename = "maxSearchPassesPerTrack")]
+    pub max_search_passes_per_track: usize,
+    #[serde(rename = "maxRequestsPerTrack")]
+    pub max_requests_per_track: usize,
+    #[serde(rename = "workerPortRange")]
+    pub worker_port_range: String,
+    #[serde(rename = "shareMode")]
+    pub share_mode: String,
+    #[serde(rename = "sharePath")]
+    pub share_path: String,
+    #[serde(rename = "shareStatus")]
+    pub share_status: String,
 }
 
 #[derive(QueryableByName)]
@@ -415,12 +447,48 @@ pub async fn network() -> impl actix_web::Responder {
 }
 
 #[get("/config")]
-pub async fn config() -> impl actix_web::Responder {
+pub async fn config(state: web::Data<AppState>) -> impl actix_web::Responder {
+    let tuning = WorkerTuning::from_env();
+    let runtime_config =
+        convert_invert::internals::utils::config::config_manager::Config::try_from_env().ok();
+    let port_last = state
+        .config
+        .port_base
+        .saturating_add(state.config.worker_count.saturating_sub(1) as u16);
+    let share_mode = std::env::var("SHARE_MODE").unwrap_or_else(|_| "disabled".to_string());
+    let share_path = std::env::var("SHARE_PATH").unwrap_or_else(|_| "/downloads".to_string());
+    let share_status = match share_mode.as_str() {
+        "external" => "external_client_required",
+        "disabled" => "disabled",
+        _ => "invalid_mode",
+    }
+    .to_string();
     HttpResponse::Ok().json(ConfigResponse {
         judge_threshold: JUDGE_THRESHOLD,
         auth: AuthConfig {
             scheme: "api_key",
             header: "X-API-Key",
+        },
+        tuning: TuningConfig {
+            search_concurrency: tuning.search_concurrency,
+            download_concurrency: tuning.download_concurrency,
+            search_timeout_secs: runtime_config
+                .as_ref()
+                .map(|config| config.search_timeout_secs)
+                .unwrap_or(20),
+            search_empty_result_cutoff: runtime_config
+                .as_ref()
+                .map(|config| config.search_empty_result_cutoff)
+                .unwrap_or(8),
+            max_candidates_per_track: tuning.max_candidates_per_track,
+            max_download_attempts_per_track: tuning.max_download_attempts_per_track,
+            candidate_collection_secs: tuning.candidate_collection_secs,
+            max_search_passes_per_track: tuning.max_search_passes_per_track,
+            max_requests_per_track: tuning.max_requests_per_track,
+            worker_port_range: format!("{}-{port_last}", state.config.port_base),
+            share_mode,
+            share_path,
+            share_status,
         },
     })
 }

@@ -19,6 +19,9 @@ struct LogStats {
     db_pool_timeouts: usize,
     duplicate_track_insert_errors: usize,
     retries: usize,
+    budget_exhausted: usize,
+    search_passes: usize,
+    download_attempts: usize,
     empty_result_exits: usize,
     download_timeouts: usize,
     connection_timeouts: usize,
@@ -151,6 +154,15 @@ impl LogStats {
         if text.contains("Retry requested") {
             self.retries += 1;
         }
+        if text.contains("Request budget exhausted") {
+            self.budget_exhausted += 1;
+        }
+        if text.contains("Scheduling search") || text.contains("Scheduling relaxed retry search") {
+            self.search_passes += 1;
+        }
+        if text.contains("Scheduling download") {
+            self.download_attempts += 1;
+        }
         if text.contains("Exited because consecutive empty results") {
             self.empty_result_exits += 1;
         }
@@ -226,6 +238,9 @@ impl LogStats {
             self.downloaded_by_track_id.len()
         );
         println!("  retry_requests: {}", self.retries);
+        println!("  budget_exhausted: {}", self.budget_exhausted);
+        println!("  search_passes: {}", self.search_passes);
+        println!("  download_attempts: {}", self.download_attempts);
         println!("  empty_result_exits: {}", self.empty_result_exits);
         println!("  download_timeout_warnings: {}", self.download_timeouts);
         println!("  peer_disconnects: {}", self.peer_disconnects);

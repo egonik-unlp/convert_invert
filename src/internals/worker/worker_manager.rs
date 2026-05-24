@@ -10,7 +10,7 @@ use serde::Serialize;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-use crate::internals::context::context_manager::{Managers, RedisPool, Track};
+use crate::internals::context::context_manager::{Managers, RedisPool, Track, WorkerTuning};
 use crate::internals::database::DbPool;
 use crate::internals::query::query_manager::QueryManager;
 use crate::internals::search::search_manager::SearchItem;
@@ -115,6 +115,26 @@ impl WorkerSupervisor {
 
         self.replace_queue(&options.playlist_id, options.chunk_size, &items)
             .context("Build worker queue")?;
+
+        let tuning = WorkerTuning::from_env();
+        let last_port = options
+            .port_base
+            .saturating_add(options.worker_count.saturating_sub(1) as u16);
+        tracing::info!(
+            worker_count = options.worker_count,
+            chunk_size = options.chunk_size,
+            port_base = options.port_base,
+            port_last = last_port,
+            search_concurrency = tuning.search_concurrency,
+            download_concurrency = tuning.download_concurrency,
+            max_candidates_per_track = tuning.max_candidates_per_track,
+            max_download_attempts_per_track = tuning.max_download_attempts_per_track,
+            candidate_collection_secs = tuning.candidate_collection_secs,
+            max_search_passes_per_track = tuning.max_search_passes_per_track,
+            max_requests_per_track = tuning.max_requests_per_track,
+            playlist_id = %options.playlist_id,
+            "Starting workers",
+        );
 
         let mut spawned = Vec::with_capacity(options.worker_count);
         let mut guard = self
@@ -366,7 +386,18 @@ async fn run_worker(config: WorkerRunConfig) {
             .collect::<Vec<_>>();
 
         tokio::select! {
-            _ = managers.run_chunk(tracks) => {}
+            result = managers.run_chunk(tracks) => {
+                if let Err(err) = result {
+                    tracing::error!(
+                        ?err,
+                        run_id = %worker_config.run_id,
+                        username = %worker_config.user_name,
+                        port = worker_config.listen_port,
+                        chunk_size,
+                        "run_chunk failed",
+                    );
+                }
+            }
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     tracing::info!(run_id = %worker_config.run_id, "Worker shutdown mid-cycle");
@@ -391,8 +422,17 @@ async fn run_worker(config: WorkerRunConfig) {
                 .filter(|item| failed_ids.contains(&item.track_id))
                 .map(Track::Query)
                 .collect::<Vec<_>>();
-            if !failed_items.is_empty() {
-                let _ = managers.run_chunk(failed_items).await;
+            if !failed_items.is_empty()
+                && let Err(err) = managers.run_chunk(failed_items).await
+            {
+                tracing::error!(
+                    ?err,
+                    run_id = %worker_config.run_id,
+                    username = %worker_config.user_name,
+                    port = worker_config.listen_port,
+                    chunk_size,
+                    "failed-track replay run_chunk failed",
+                );
             }
         }
     }

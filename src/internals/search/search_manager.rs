@@ -78,7 +78,7 @@ impl From<Playlist> for Vec<SearchItem> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Hash)]
 pub struct DownloadableFile {
     pub filename: String,
     pub username: String,

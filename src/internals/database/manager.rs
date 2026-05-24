@@ -312,6 +312,7 @@ impl<'a> DatabaseManager<'a> {
                     Track::Downloadable(judge_submission) => {
                         Self::update_jugde_submission_score(connection, judge_submission)?;
                     }
+                    Track::SelectCandidate(_) => {}
                     Track::File(downloaded_file) => {
                         Self::upsert_downloaded_file(connection, downloaded_file)?;
                     }

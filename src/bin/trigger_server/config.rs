@@ -35,7 +35,7 @@ pub fn load() -> anyhow::Result<AppConfig> {
     let worker_count = std::env::var("WORKER_COUNT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(4);
+        .unwrap_or(1);
     let username_prefix =
         std::env::var("WORKER_USERNAME_PREFIX").unwrap_or_else(|_| "worker".to_string());
     let port_base = std::env::var("WORKER_PORT_BASE")

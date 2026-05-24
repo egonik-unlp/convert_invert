@@ -46,11 +46,11 @@ impl Config {
         };
 
         let search_timeout_secs: u8 = {
-            let val = env::var("SEARCH_TIMEOUT_SECS").unwrap_or("12".to_string());
+            let val = env::var("SEARCH_TIMEOUT_SECS").unwrap_or("20".to_string());
             val.parse().context("Cannot parse SEARCH_TIMEOUT_SECS")?
         };
         let search_empty_result_cutoff: usize = {
-            let val = env::var("SEARCH_EMPTY_RESULT_CUTOFF").unwrap_or("5".to_string());
+            let val = env::var("SEARCH_EMPTY_RESULT_CUTOFF").unwrap_or("8".to_string());
             val.parse()
                 .context("Cannot parse SEARCH_EMPTY_RESULT_CUTOFF")?
         };
