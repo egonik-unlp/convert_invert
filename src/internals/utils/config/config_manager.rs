@@ -17,6 +17,8 @@ pub struct Config {
     pub playlist_id: String,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
+    pub share_mode: String,
+    pub share_path: String,
 }
 
 impl Config {
@@ -54,6 +56,9 @@ impl Config {
             val.parse()
                 .context("Cannot parse SEARCH_EMPTY_RESULT_CUTOFF")?
         };
+        let share_mode = env::var("SHARE_MODE").unwrap_or_else(|_| "disabled".to_string());
+        let share_path = env::var("SHARE_PATH").unwrap_or_else(|_| "/downloads".to_string());
+
         Ok(Config {
             run_id,
             log_level,
@@ -67,6 +72,8 @@ impl Config {
             playlist_id,
             client_id,
             client_secret,
+            share_mode,
+            share_path,
         })
     }
 
@@ -84,6 +91,8 @@ impl Config {
         playlist_id: String,
         client_id: Option<String>,
         client_secret: Option<String>,
+        share_mode: String,
+        share_path: String,
     ) -> Self {
         Config {
             run_id,
@@ -98,6 +107,8 @@ impl Config {
             playlist_id,
             client_id,
             client_secret,
+            share_mode,
+            share_path,
         }
     }
 }

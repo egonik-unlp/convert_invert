@@ -34,6 +34,15 @@ fn downloadable_size(size: u64) -> Option<i64> {
     i64::try_from(size).ok()
 }
 
+pub fn is_audio_file(filename: &str) -> bool {
+    let lower = filename.to_ascii_lowercase();
+    [
+        ".mp3", ".flac", ".aiff", ".aif", ".aac", ".m4a", ".ogg", ".opus", ".wav",
+    ]
+    .iter()
+    .any(|extension| lower.ends_with(extension))
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Hash, PartialEq, Eq)]
 pub struct SearchItem {
     pub track_id: String,
@@ -94,6 +103,7 @@ pub struct JudgeSubmission {
     pub track: SearchItem,
     pub query: DownloadableFile,
     pub score: Option<f32>,
+    pub relative_mi_score: Option<f32>,
 }
 impl PartialEq for JudgeSubmission {
     fn eq(&self, other: &Self) -> bool {
@@ -113,6 +123,7 @@ impl SearchManager {
         result
             .files
             .into_iter()
+            .filter(|file| is_audio_file(&file.name))
             .filter_map(|f| {
                 let size = match downloadable_size(f.size) {
                     Some(size) => size,
@@ -133,6 +144,7 @@ impl SearchManager {
                     },
                     track: track.clone(),
                     score: None,
+                    relative_mi_score: None,
                 })
             })
             .collect()
@@ -203,8 +215,9 @@ pub async fn track_search_task(
     let mut count = 0;
     let mut total_files_found = 0;
     let mut candidates_sent = 0usize;
+    let poll_interval = Duration::from_secs(u64::from(timeout_secs.clamp(1, 3)));
     'main: loop {
-        sleep(search_timeout).await;
+        sleep(poll_interval).await;
         let results = client.get_search_results(&query_string);
         let current_total_files: usize = results.iter().map(|res| res.files.len()).sum();
 
@@ -275,7 +288,7 @@ pub async fn track_search_task(
 
 #[cfg(test)]
 mod tests {
-    use super::{SearchItem, downloadable_size};
+    use super::{SearchItem, downloadable_size, is_audio_file};
 
     #[test]
     fn metadata_fallback_id_is_deterministic() {
@@ -298,5 +311,23 @@ mod tests {
     fn downloadable_size_rejects_values_that_do_not_fit_database_type() {
         assert_eq!(downloadable_size(i64::MAX as u64), Some(i64::MAX));
         assert_eq!(downloadable_size(i64::MAX as u64 + 1), None);
+    }
+
+    #[test]
+    fn audio_detection_accepts_common_music_extensions() {
+        assert!(is_audio_file("song.MP3"));
+        assert!(is_audio_file("song.flac"));
+        assert!(is_audio_file("song.m4a"));
+        assert!(is_audio_file("song.opus"));
+        assert!(is_audio_file("song.ogg"));
+        assert!(is_audio_file("song.wav"));
+        assert!(is_audio_file("song.aif"));
+    }
+
+    #[test]
+    fn audio_detection_rejects_non_audio_files() {
+        assert!(!is_audio_file("folder.jpg"));
+        assert!(!is_audio_file("playlist.m3u8"));
+        assert!(!is_audio_file("song.flac.txt"));
     }
 }

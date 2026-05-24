@@ -24,6 +24,9 @@ USER_PASSWORD=
 ```
 
 The Compose defaults provide Postgres, Redis, Jaeger, and `/downloads` wiring for local development.
+The default worker account mode is `same`: run one worker using `USER_NAME`, and
+let the Compose sharing sidecar log in with the same Soulseek credentials while
+sharing the downloaded files.
 
 ## Analyze Worker Logs
 

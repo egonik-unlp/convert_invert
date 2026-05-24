@@ -16,6 +16,7 @@ pub async fn start_workers(
         &state.config.username_prefix,
         state.config.port_base,
         &state.config.run_id_prefix,
+        &state.config.worker_account_mode,
     )?;
 
     let base_config = Config::try_from_env()
@@ -30,6 +31,7 @@ pub async fn start_workers(
                 username_prefix: request.username_prefix,
                 port_base: request.port_base,
                 run_id_prefix: request.run_id_prefix,
+                account_mode: state.config.worker_account_mode.clone(),
                 playlist_id: request.playlist_id,
                 chunk_size: request.chunk_size,
                 playlist_range: request.playlist_range,

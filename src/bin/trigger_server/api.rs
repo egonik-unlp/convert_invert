@@ -69,6 +69,8 @@ pub struct TrackResponse {
     pub status: String,
     pub progress: i32,
     pub score: Option<f32>,
+    #[serde(rename = "relativeMiScore")]
+    pub relative_mi_score: Option<f32>,
     #[serde(rename = "candidatesCount")]
     pub candidates_count: i64,
     #[serde(rename = "rejectReason")]
@@ -89,6 +91,8 @@ pub struct CandidateResponse {
     pub username: String,
     pub filename: String,
     pub score: f32,
+    #[serde(rename = "relativeMiScore")]
+    pub relative_mi_score: Option<f32>,
 }
 
 #[derive(Serialize)]
@@ -173,6 +177,8 @@ struct TrackQueryRow {
     candidates_count: i64,
     #[diesel(sql_type = Nullable<Float4>)]
     max_score: Option<f32>,
+    #[diesel(sql_type = Nullable<Float4>)]
+    max_relative_mi_score: Option<f32>,
     #[diesel(sql_type = Text)]
     track_status: String,
 }
@@ -189,6 +195,8 @@ struct CandidateQueryRow {
     filename: String,
     #[diesel(sql_type = Nullable<Float4>)]
     score: Option<f32>,
+    #[diesel(sql_type = Nullable<Float4>)]
+    relative_mi_score: Option<f32>,
 }
 
 #[derive(QueryableByName)]
@@ -449,14 +457,13 @@ pub async fn network() -> impl actix_web::Responder {
 #[get("/config")]
 pub async fn config(state: web::Data<AppState>) -> impl actix_web::Responder {
     let tuning = WorkerTuning::from_env();
-    let runtime_config =
-        convert_invert::internals::utils::config::config_manager::Config::try_from_env().ok();
+    let runtime_config = state.config.clone();
     let port_last = state
         .config
         .port_base
         .saturating_add(state.config.worker_count.saturating_sub(1) as u16);
-    let share_mode = std::env::var("SHARE_MODE").unwrap_or_else(|_| "disabled".to_string());
-    let share_path = std::env::var("SHARE_PATH").unwrap_or_else(|_| "/downloads".to_string());
+    let share_mode = runtime_config.share_mode.clone();
+    let share_path = runtime_config.share_path.clone();
     let share_status = match share_mode.as_str() {
         "external" => "external_client_required",
         "disabled" => "disabled",
@@ -472,14 +479,8 @@ pub async fn config(state: web::Data<AppState>) -> impl actix_web::Responder {
         tuning: TuningConfig {
             search_concurrency: tuning.search_concurrency,
             download_concurrency: tuning.download_concurrency,
-            search_timeout_secs: runtime_config
-                .as_ref()
-                .map(|config| config.search_timeout_secs)
-                .unwrap_or(20),
-            search_empty_result_cutoff: runtime_config
-                .as_ref()
-                .map(|config| config.search_empty_result_cutoff)
-                .unwrap_or(8),
+            search_timeout_secs: runtime_config.search_timeout_secs,
+            search_empty_result_cutoff: runtime_config.search_empty_result_cutoff,
             max_candidates_per_track: tuning.max_candidates_per_track,
             max_download_attempts_per_track: tuning.max_download_attempts_per_track,
             candidate_collection_secs: tuning.candidate_collection_secs,
@@ -557,6 +558,7 @@ pub async fn playlist(
             ) AS reject_value,
             (SELECT COUNT(*) FROM judge_submissions js WHERE js.track = si.id) AS candidates_count,
             (SELECT MAX(js.score) FROM judge_submissions js WHERE js.track = si.id) AS max_score,
+            (SELECT MAX(js.relative_mi_score) FROM judge_submissions js WHERE js.track = si.id) AS max_relative_mi_score,
             CASE
                 WHEN EXISTS (
                     SELECT 1 FROM downloaded_file df
@@ -627,6 +629,7 @@ pub async fn playlist(
                 status: track_status,
                 progress,
                 score: row.max_score,
+                relative_mi_score: row.max_relative_mi_score,
                 candidates_count: row.candidates_count,
                 reject_reason: format_reject_reason(row.reject_reason, row.reject_value),
                 download_status,
@@ -646,7 +649,7 @@ pub async fn candidates(
     let mut connection = state.db_pool.get()?;
     let rows = diesel::sql_query(
         r#"
-            SELECT js.id AS submission_id, dlf.id AS file_id, dlf.username, dlf.filename, js.score
+            SELECT js.id AS submission_id, dlf.id AS file_id, dlf.username, dlf.filename, js.score, js.relative_mi_score
             FROM judge_submissions js
             JOIN downloadable_files dlf ON js.query = dlf.id
             WHERE js.track = $1
@@ -663,6 +666,7 @@ pub async fn candidates(
             username: row.username,
             filename: row.filename,
             score: row.score.unwrap_or(0.0),
+            relative_mi_score: row.relative_mi_score,
         })
         .collect::<Vec<_>>();
     Ok(HttpResponse::Ok().json(response))

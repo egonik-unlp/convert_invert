@@ -7,6 +7,7 @@ use tokio::sync::mpsc::Sender;
 
 use crate::internals::{
     context::context_manager::{RejectReason, RejectedTrack, Track, send},
+    judge::judges::relative_mi::RelativeMi,
     search::search_manager::JudgeSubmission,
 };
 
@@ -32,11 +33,16 @@ pub trait Judge: Send + Sync {
 
 pub struct JudgeManager {
     pub method: Box<dyn Judge>,
+    pub experimental_method: Box<dyn Judge>,
     pub threshold: f32,
 }
 impl JudgeManager {
     pub fn new(method: Box<dyn Judge>, threshold: f32) -> JudgeManager {
-        JudgeManager { method, threshold }
+        JudgeManager {
+            method,
+            experimental_method: Box::new(RelativeMi::new()),
+            threshold,
+        }
     }
     pub async fn run(
         &self,
@@ -50,7 +56,13 @@ impl JudgeManager {
             .judge_score(track.clone())
             .await
             .context("awaiting judge response")?;
+        let relative_mi_response = self
+            .experimental_method
+            .judge_score(track)
+            .await
+            .context("awaiting experimental judge response")?;
         inner_track.score = Some(response);
+        inner_track.relative_mi_score = Some(relative_mi_response);
         if response > self.threshold {
             send(Track::Downloadable(inner_track), &sender)
                 .await
@@ -108,6 +120,7 @@ mod tests {
                 size: 1024,
             },
             score: None,
+            relative_mi_score: None,
         }
     }
 
@@ -122,7 +135,10 @@ mod tests {
             .expect("judge run");
 
         match receiver.recv().await.expect("message") {
-            Track::Downloadable(track) => assert_eq!(track.score, Some(0.8)),
+            Track::Downloadable(track) => {
+                assert_eq!(track.score, Some(0.8));
+                assert!(track.relative_mi_score.is_some());
+            }
             other => panic!("unexpected message: {other:?}"),
         }
     }
@@ -139,8 +155,9 @@ mod tests {
 
         match receiver.recv().await.expect("message") {
             Track::Reject(track) => {
-                let (_, reason) = track.parts();
+                let (submission, reason) = track.parts();
                 assert!(matches!(reason, RejectReason::LowScore(score) if *score == 0.75));
+                assert!(submission.relative_mi_score.is_some());
             }
             other => panic!("unexpected message: {other:?}"),
         }

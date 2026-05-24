@@ -177,8 +177,8 @@ impl WorkerTuning {
             search_concurrency: env_usize("SEARCH_CONCURRENCY", 1),
             download_concurrency: env_usize("DOWNLOAD_CONCURRENCY", 1),
             queue_capacity: env_usize("QUEUE_CAPACITY", 20000),
-            max_candidates_per_track: env_usize("MAX_CANDIDATES_PER_TRACK", 3).max(1),
-            max_download_attempts_per_track: env_usize("MAX_DOWNLOAD_ATTEMPTS_PER_TRACK", 2).max(1),
+            max_candidates_per_track: env_usize("MAX_CANDIDATES_PER_TRACK", 8).max(1),
+            max_download_attempts_per_track: env_usize("MAX_DOWNLOAD_ATTEMPTS_PER_TRACK", 4).max(1),
             candidate_collection_secs: env_u64("CANDIDATE_COLLECTION_SECS", 20),
             max_search_passes_per_track: env_usize("MAX_SEARCH_PASSES_PER_TRACK", 2).max(1),
             max_requests_per_track: env_usize("MAX_REQUESTS_PER_TRACK", 8).max(1),
@@ -559,7 +559,7 @@ async fn process_track(
                     );
                 }
                 CandidateSelection::RetrySearch => {
-                    schedule_relaxed_search(
+                    let _scheduled = schedule_relaxed_search(
                         tasks,
                         state,
                         managers,
@@ -636,33 +636,28 @@ async fn process_track(
                 CandidateSelection::Wait => return Ok(()),
                 CandidateSelection::RetrySearch | CandidateSelection::None => {}
             }
-            if retry_request.retry_attempts >= 1 {
-                let reject = RejectedTrack::new(
-                    retry_request.request,
-                    RejectReason::AbandonedAttemptingSearch,
-                );
-                send(Track::Reject(reject), sender)
-                    .await
-                    .context("rejecting")?;
-                return Ok(());
-            }
-            retry_request.retry_attempts += 1;
-            let managers = Arc::clone(managers);
-            let semaphore = search_semaphore.clone();
-            let sender = Arc::clone(sender);
-            tracing::info!(?retry_request.request, "Retry requested");
-            let search_item = retry_request.request.clone();
-            schedule_relaxed_search(
+            let original_request = retry_request.request.clone();
+            let scheduled = schedule_relaxed_search(
                 tasks,
                 state,
-                &managers,
-                semaphore,
-                sender,
-                search_item.track,
+                managers,
+                search_semaphore.clone(),
+                Arc::clone(sender),
+                original_request.track.clone(),
                 "retry_search",
             )
             .await;
-            tracing::debug!(?retry_request, "Retry queued")
+            if !scheduled {
+                let reject =
+                    RejectedTrack::new(original_request, RejectReason::AbandonedAttemptingSearch);
+                send(Track::Reject(reject), sender)
+                    .await
+                    .context("rejecting exhausted retry search budget")?;
+            } else {
+                retry_request.retry_attempts += 1;
+                tracing::info!(?retry_request.request, "Retry requested");
+                tracing::debug!(?retry_request, "Retry queued");
+            }
         }
         Track::Reject(rejected_track) => {
             state
@@ -717,7 +712,7 @@ async fn schedule_relaxed_search(
     sender: Arc<Sender<Track>>,
     search_item: SearchItem,
     label: &'static str,
-) {
+) -> bool {
     let tuning = WorkerTuning::from_env();
     let request_allowed = {
         let mut state_guard = state.write().await;
@@ -730,7 +725,7 @@ async fn schedule_relaxed_search(
             max_requests_per_track = tuning.max_requests_per_track,
             "Request budget exhausted before relaxed search",
         );
-        return;
+        return false;
     }
     let managers = Arc::clone(managers);
     tracing::info!(?search_item, "Scheduling relaxed retry search");
@@ -749,6 +744,7 @@ async fn schedule_relaxed_search(
             .context("returning track")?;
         Ok(())
     });
+    true
 }
 
 fn spend_request(
@@ -859,7 +855,11 @@ fn quality_rank(filename: &str) -> u8 {
         3
     } else if lower.ends_with(".mp3") {
         2
-    } else if lower.ends_with(".aac") || lower.ends_with(".m4a") || lower.ends_with(".ogg") {
+    } else if lower.ends_with(".aac")
+        || lower.ends_with(".m4a")
+        || lower.ends_with(".ogg")
+        || lower.ends_with(".opus")
+    {
         1
     } else {
         0
@@ -947,6 +947,7 @@ mod tests {
                 size,
             },
             score: Some(score),
+            relative_mi_score: None,
         }
     }
 

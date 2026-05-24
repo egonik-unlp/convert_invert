@@ -5,6 +5,7 @@ use crate::internals::{
     database::db_pool_snapshot,
     database::manager::DatabaseManager,
     search::search_manager::JudgeSubmission,
+    search::search_manager::is_audio_file,
 };
 use anyhow::Context;
 use redis::TypedCommands;
@@ -15,11 +16,6 @@ use tokio::{
     sync::{Semaphore, mpsc::Sender},
     task::JoinHandle,
 };
-
-fn is_audio_file(filename: String) -> bool {
-    let lc = filename.to_lowercase();
-    lc.ends_with(".mp3") || lc.ends_with(".flac") || lc.ends_with(".aiff") || lc.ends_with(".aac")
-}
 
 pub struct DownloadManager {
     client: Arc<Client>,
@@ -50,7 +46,7 @@ impl DownloadManager {
                 .context("Redis pool in run")?;
             redis_con.sismember::<_, _>("ban-list", id).unwrap_or(false)
         };
-        if is_audio_file(track.query.filename.clone()) && !is_banned {
+        if is_audio_file(&track.query.filename) && !is_banned {
             let _permit = semaphore.acquire().await.context("acquiring semaphore")?;
             tracing::debug!(track.query.filename, "send to download");
             let track = download_track(
@@ -420,19 +416,21 @@ async fn download_track(
 
 #[cfg(test)]
 mod tests {
-    use super::is_audio_file;
+    use crate::internals::search::search_manager::is_audio_file;
 
     #[test]
     fn audio_detection_accepts_supported_extensions_case_insensitively() {
-        assert!(is_audio_file("song.MP3".to_string()));
-        assert!(is_audio_file("song.flac".to_string()));
-        assert!(is_audio_file("song.AIFF".to_string()));
-        assert!(is_audio_file("song.aac".to_string()));
+        assert!(is_audio_file("song.MP3"));
+        assert!(is_audio_file("song.flac"));
+        assert!(is_audio_file("song.AIFF"));
+        assert!(is_audio_file("song.aac"));
+        assert!(is_audio_file("song.m4a"));
+        assert!(is_audio_file("song.opus"));
     }
 
     #[test]
     fn audio_detection_rejects_unsupported_extensions() {
-        assert!(!is_audio_file("song.txt".to_string()));
-        assert!(!is_audio_file("song.mp3.exe".to_string()));
+        assert!(!is_audio_file("song.txt"));
+        assert!(!is_audio_file("song.mp3.exe"));
     }
 }

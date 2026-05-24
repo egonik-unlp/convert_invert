@@ -187,7 +187,10 @@ impl<'a> DatabaseManager<'a> {
             schema::judge_submissions::table
                 .filter(schema::judge_submissions::id.eq(&judge_submission_id)),
         )
-        .set(schema::judge_submissions::score.eq(judge_submission.score))
+        .set((
+            schema::judge_submissions::score.eq(judge_submission.score),
+            schema::judge_submissions::relative_mi_score.eq(judge_submission.relative_mi_score),
+        ))
         .execute(connection)
         .context("update and set score")?;
         Ok(())
@@ -206,6 +209,7 @@ impl<'a> DatabaseManager<'a> {
             track: track_id,
             query: query_id,
             score: None,
+            relative_mi_score: None,
         };
         insert_into(schema::judge_submissions::table)
             .values(&value)

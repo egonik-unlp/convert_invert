@@ -42,6 +42,15 @@ async fn main() -> anyhow::Result<()> {
     let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "api".to_string());
     trace::otel_trace::init_tracing_with_otel("convert-invert-api".to_string(), run_id)
         .context("Tracing")?;
+    tracing::info!(
+        worker_account_mode = %app_config.worker_account_mode,
+        worker_username = %app_config.username_prefix,
+        worker_port_base = app_config.port_base,
+        download_path = %app_config.download_path.display(),
+        share_mode = %app_config.share_mode,
+        share_path = %app_config.share_path,
+        "Loaded worker/share configuration",
+    );
 
     let db_pool = convert_invert::internals::database::init_pool()?;
     let tuning = WorkerTuning::from_env();

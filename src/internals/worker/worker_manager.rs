@@ -38,6 +38,7 @@ pub struct WorkerStartOptions {
     pub username_prefix: String,
     pub port_base: u16,
     pub run_id_prefix: String,
+    pub account_mode: String,
     pub playlist_id: String,
     pub chunk_size: usize,
     pub playlist_range: Option<(usize, usize)>,
@@ -133,6 +134,8 @@ impl WorkerSupervisor {
             max_search_passes_per_track = tuning.max_search_passes_per_track,
             max_requests_per_track = tuning.max_requests_per_track,
             playlist_id = %options.playlist_id,
+            account_mode = %options.account_mode,
+            username = %options.username_prefix,
             "Starting workers",
         );
 
@@ -146,6 +149,7 @@ impl WorkerSupervisor {
             let info = worker_info(
                 self.next_worker_id.fetch_add(1, Ordering::Relaxed),
                 &options.username_prefix,
+                &options.account_mode,
                 options.port_base,
                 &options.run_id_prefix,
                 index,
@@ -300,14 +304,20 @@ pub fn apply_playlist_range(
 fn worker_info(
     worker_id: usize,
     username_prefix: &str,
+    account_mode: &str,
     port_base: u16,
     run_id_prefix: &str,
     index: usize,
 ) -> WorkerInfo {
     let worker_number = index + 1;
+    let username = if account_mode == "same" {
+        username_prefix.to_string()
+    } else {
+        format!("{username_prefix}{worker_number}")
+    };
     WorkerInfo {
         id: worker_id,
-        username: format!("{username_prefix}{worker_number}"),
+        username,
         port: port_base.saturating_add(index as u16),
         run_id: format!("{run_id_prefix}-{worker_number}"),
         started_at_epoch_secs: SystemTime::now()
@@ -491,10 +501,19 @@ mod tests {
 
     #[test]
     fn worker_info_uses_one_based_worker_suffixes() {
-        let info = worker_info(7, "worker", 41000, "run", 2);
+        let info = worker_info(7, "worker", "multi", 41000, "run", 2);
         assert_eq!(info.id, 7);
         assert_eq!(info.username, "worker3");
         assert_eq!(info.port, 41002);
         assert_eq!(info.run_id, "run-3");
+    }
+
+    #[test]
+    fn worker_info_uses_exact_username_in_same_account_mode() {
+        let info = worker_info(7, "real-user", "same", 41000, "run", 0);
+        assert_eq!(info.id, 7);
+        assert_eq!(info.username, "real-user");
+        assert_eq!(info.port, 41000);
+        assert_eq!(info.run_id, "run-1");
     }
 }

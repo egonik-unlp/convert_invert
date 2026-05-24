@@ -39,12 +39,18 @@ impl StartRequest {
         default_username_prefix: &str,
         default_port_base: u16,
         default_run_id_prefix: &str,
+        worker_account_mode: &str,
     ) -> Result<StartRequestValidated, ApiError> {
         let worker_count = self.worker_count.unwrap_or(default_worker_count);
         if worker_count == 0 || worker_count > MAX_WORKER_COUNT {
             return Err(ApiError::BadRequest(format!(
                 "worker_count must be 1..={MAX_WORKER_COUNT}"
             )));
+        }
+        if worker_account_mode == "same" && worker_count != 1 {
+            return Err(ApiError::BadRequest(
+                "WORKER_ACCOUNT_MODE=same requires worker_count=1 so the downloader and share service use one Soulseek account".into(),
+            ));
         }
 
         let port_base = self.port_base.unwrap_or(default_port_base);
@@ -90,6 +96,11 @@ impl StartRequest {
             .username_prefix
             .filter(|prefix| !prefix.is_empty())
             .unwrap_or_else(|| default_username_prefix.to_string());
+        if worker_account_mode == "same" && username_prefix != default_username_prefix {
+            return Err(ApiError::BadRequest(
+                "username_prefix cannot override USER_NAME when WORKER_ACCOUNT_MODE=same".into(),
+            ));
+        }
         let run_id_prefix = self
             .run_id_prefix
             .filter(|prefix| !prefix.is_empty())
@@ -133,5 +144,53 @@ impl PlaylistQuery {
             limit: limit as i64,
             cursor: self.cursor,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StartRequest;
+    use crate::errors::ApiError;
+
+    fn start_request(worker_count: Option<usize>, username_prefix: Option<&str>) -> StartRequest {
+        StartRequest {
+            worker_count,
+            username_prefix: username_prefix.map(str::to_string),
+            port_base: None,
+            run_id_prefix: None,
+            playlist_id: Some("playlist".to_string()),
+            chunk_size: None,
+            playlist_range_start: None,
+            playlist_range_end: None,
+        }
+    }
+
+    #[test]
+    fn same_account_mode_accepts_one_worker_with_configured_username() {
+        let result = start_request(Some(1), None)
+            .validate(1, "real-user", 41000, "run", "same")
+            .expect("valid same-account request");
+
+        assert_eq!(result.worker_count, 1);
+        assert_eq!(result.username_prefix, "real-user");
+    }
+
+    #[test]
+    fn same_account_mode_rejects_multiple_workers() {
+        let result = start_request(Some(2), None).validate(1, "real-user", 41000, "run", "same");
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message.contains("worker_count=1"))
+        );
+    }
+
+    #[test]
+    fn same_account_mode_rejects_username_override() {
+        let result =
+            start_request(Some(1), Some("other")).validate(1, "real-user", 41000, "run", "same");
+
+        assert!(
+            matches!(result, Err(ApiError::BadRequest(message)) if message.contains("username_prefix"))
+        );
     }
 }

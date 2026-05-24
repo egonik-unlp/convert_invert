@@ -29,6 +29,7 @@ diesel::table! {
         track -> Int4,
         query -> Int4,
         score -> Nullable<Float4>,
+        relative_mi_score -> Nullable<Float4>,
     }
 }
 
