@@ -32,10 +32,28 @@ use crate::internals::{
 };
 
 /// Metadata for a successfully downloaded file.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadedFile {
     pub filename: String,
     pub track: SearchItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RunEvent {
+    SearchQueued(SearchItem),
+    SearchRetryQueued(SearchItem),
+    CandidateFound(JudgeSubmission),
+    CandidateAccepted(JudgeSubmission),
+    CandidateSelected(JudgeSubmission),
+    FileDownloaded(DownloadedFile),
+    RetryQueued {
+        request: JudgeSubmission,
+        failed: DownloadableFile,
+    },
+    Rejected {
+        track: JudgeSubmission,
+        reason: String,
+    },
 }
 
 struct ManagedTaskResult {
@@ -46,6 +64,7 @@ struct ManagedTaskResult {
 struct RunCycleShared<'a> {
     managers: &'a Arc<Managers>,
     sender: &'a Arc<Sender<Track>>,
+    events: Option<&'a Arc<Sender<RunEvent>>>,
     state: &'a Arc<tokio::sync::RwLock<RunState>>,
     search_semaphore: &'a Arc<Semaphore>,
     download_semaphore: &'a Arc<Semaphore>,
@@ -277,6 +296,14 @@ impl Managers {
         self: &Arc<Self>,
         tracks: impl IntoIterator<Item = Track>,
     ) -> anyhow::Result<()> {
+        self.run_chunk_with_events(tracks, None).await
+    }
+
+    pub async fn run_chunk_with_events(
+        self: &Arc<Self>,
+        tracks: impl IntoIterator<Item = Track>,
+        events: Option<Arc<Sender<RunEvent>>>,
+    ) -> anyhow::Result<()> {
         let managers = Arc::clone(self);
         let tuning = WorkerTuning::from_env();
         let (sender, mut receiver) = mpsc::channel(tuning.queue_capacity);
@@ -319,6 +346,7 @@ impl Managers {
                     let shared = RunCycleShared {
                         managers: &managers,
                         sender: &sender,
+                        events: events.as_ref(),
                         state: &state,
                         search_semaphore: &search_semaphore,
                         download_semaphore: &download_semaphore,
@@ -371,10 +399,13 @@ async fn process_track(
     let RunCycleShared {
         managers,
         sender,
+        events,
         state,
         search_semaphore,
         download_semaphore,
     } = shared;
+
+    emit_run_event(events, event_from_track(&track)).await;
 
     if !matches!(track, Track::SelectCandidate(_)) {
         let mut conn = managers.db_pool.get().map_err(|err| {
@@ -549,6 +580,11 @@ async fn process_track(
             };
             match selection {
                 CandidateSelection::Download(judge_submission) => {
+                    emit_run_event(
+                        events,
+                        Some(RunEvent::CandidateSelected(judge_submission.clone())),
+                    )
+                    .await;
                     schedule_download(
                         tasks,
                         managers,
@@ -660,6 +696,15 @@ async fn process_track(
             }
         }
         Track::Reject(rejected_track) => {
+            let (track, reason) = rejected_track.parts();
+            emit_run_event(
+                events,
+                Some(RunEvent::Rejected {
+                    track: track.clone(),
+                    reason: format!("{reason:?}"),
+                }),
+            )
+            .await;
             state
                 .write()
                 .await
@@ -668,6 +713,31 @@ async fn process_track(
         }
     }
     Ok(())
+}
+
+async fn emit_run_event(events: Option<&Arc<Sender<RunEvent>>>, event: Option<RunEvent>) {
+    let (Some(events), Some(event)) = (events, event) else {
+        return;
+    };
+    let _ = events.send(event).await;
+}
+
+fn event_from_track(track: &Track) -> Option<RunEvent> {
+    match track {
+        Track::Query(item) => Some(RunEvent::SearchQueued(item.clone())),
+        Track::SearchRetry(item) => Some(RunEvent::SearchRetryQueued(item.clone())),
+        Track::Result(submission) => Some(RunEvent::CandidateFound(submission.clone())),
+        Track::Downloadable(submission) => Some(RunEvent::CandidateAccepted(submission.clone())),
+        Track::File(file) => Some(RunEvent::FileDownloaded(DownloadedFile {
+            filename: file.filename.clone(),
+            track: file.track.clone(),
+        })),
+        Track::Retry(retry) => Some(RunEvent::RetryQueued {
+            request: retry.request.clone(),
+            failed: retry.failed_download_result.clone(),
+        }),
+        Track::Reject(_) | Track::SelectCandidate(_) => None,
+    }
 }
 
 enum CandidateSelection {

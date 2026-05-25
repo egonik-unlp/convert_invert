@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
+use rand::seq::SliceRandom;
 use redis::Commands;
 use serde::Serialize;
 use tokio::sync::watch;
@@ -12,6 +13,7 @@ use tokio::task::JoinHandle;
 
 use crate::internals::context::context_manager::{Managers, RedisPool, Track, WorkerTuning};
 use crate::internals::database::DbPool;
+use crate::internals::database::manager::DatabaseManager;
 use crate::internals::query::query_manager::QueryManager;
 use crate::internals::search::search_manager::SearchItem;
 use crate::internals::utils::config::config_manager::Config;
@@ -42,6 +44,7 @@ pub struct WorkerStartOptions {
     pub playlist_id: String,
     pub chunk_size: usize,
     pub playlist_range: Option<(usize, usize)>,
+    pub random_order: bool,
 }
 
 pub struct WorkerSupervisor {
@@ -106,13 +109,19 @@ impl WorkerSupervisor {
             .await
             .context("Fetch worker playlist")?;
         let playlist_tracks = apply_playlist_range(playlist_tracks, options.playlist_range);
-        let items = playlist_tracks
+        let mut items = playlist_tracks
             .into_iter()
             .filter_map(|track| match track {
                 Track::Query(item) => Some(item),
                 _ => None,
             })
             .collect::<Vec<_>>();
+        if options.random_order {
+            shuffle_items(&mut items);
+        }
+
+        self.persist_search_items(&items)
+            .context("Persist fetched playlist tracks")?;
 
         self.replace_queue(&options.playlist_id, options.chunk_size, &items)
             .context("Build worker queue")?;
@@ -134,6 +143,7 @@ impl WorkerSupervisor {
             max_search_passes_per_track = tuning.max_search_passes_per_track,
             max_requests_per_track = tuning.max_requests_per_track,
             playlist_id = %options.playlist_id,
+            random_order = options.random_order,
             account_mode = %options.account_mode,
             username = %options.username_prefix,
             "Starting workers",
@@ -243,6 +253,21 @@ impl WorkerSupervisor {
         })
     }
 
+    fn persist_search_items(&self, items: &[SearchItem]) -> anyhow::Result<()> {
+        let mut conn = self.db_pool.get().context("Acquire DB connection")?;
+        let mut database_manager = DatabaseManager::new(&mut conn);
+        for item in items {
+            database_manager
+                .load_item_to_database(&Track::Query(item.clone()))
+                .with_context(|| format!("Persist search item {}", item.track_id))?;
+        }
+        tracing::info!(
+            track_count = items.len(),
+            "Persisted fetched playlist tracks"
+        );
+        Ok(())
+    }
+
     fn replace_queue(
         &self,
         playlist_id: &str,
@@ -280,6 +305,11 @@ pub fn build_chunks(items: &[SearchItem], chunk_size: usize) -> Vec<Vec<SearchIt
         start = end;
     }
     chunks
+}
+
+pub fn shuffle_items(items: &mut [SearchItem]) {
+    let mut rng = rand::rng();
+    items.shuffle(&mut rng);
 }
 
 pub fn apply_playlist_range(
@@ -487,6 +517,27 @@ mod tests {
         let items = vec![item("1"), item("2")];
         let chunks = build_chunks(&items, 0);
         assert_eq!(chunks.len(), 2);
+    }
+
+    #[test]
+    fn range_is_applied_before_chunking() {
+        let tracks = vec![item("1"), item("2"), item("3"), item("4")]
+            .into_iter()
+            .map(Track::Query)
+            .collect::<Vec<_>>();
+        let ranged = apply_playlist_range(tracks, Some((1, 3)));
+        let items = ranged
+            .into_iter()
+            .filter_map(|track| match track {
+                Track::Query(item) => Some(item),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let chunks = build_chunks(&items, 1);
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0][0].track_id, "2");
+        assert_eq!(chunks[1][0].track_id, "3");
     }
 
     #[test]

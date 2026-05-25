@@ -20,6 +20,7 @@ pub struct StartRequest {
     pub chunk_size: Option<usize>,
     pub playlist_range_start: Option<usize>,
     pub playlist_range_end: Option<usize>,
+    pub random_order: Option<bool>,
 }
 
 pub struct StartRequestValidated {
@@ -30,6 +31,7 @@ pub struct StartRequestValidated {
     pub playlist_id: String,
     pub chunk_size: usize,
     pub playlist_range: Option<(usize, usize)>,
+    pub random_order: bool,
 }
 
 impl StartRequest {
@@ -49,7 +51,7 @@ impl StartRequest {
         }
         if worker_account_mode == "same" && worker_count != 1 {
             return Err(ApiError::BadRequest(
-                "WORKER_ACCOUNT_MODE=same requires worker_count=1 so the downloader and share service use one Soulseek account".into(),
+                "WORKER_ACCOUNT_MODE=same requires worker_count=1 because one downloader username is used without numeric suffixes".into(),
             ));
         }
 
@@ -92,13 +94,16 @@ impl StartRequest {
             _ => None,
         };
 
-        let username_prefix = self
-            .username_prefix
-            .filter(|prefix| !prefix.is_empty())
-            .unwrap_or_else(|| default_username_prefix.to_string());
-        if worker_account_mode == "same" && username_prefix != default_username_prefix {
+        let username_prefix = if worker_account_mode == "same" {
+            default_username_prefix.to_string()
+        } else {
+            self.username_prefix
+                .filter(|prefix| !prefix.trim().is_empty())
+                .unwrap_or_else(|| default_username_prefix.to_string())
+        };
+        if worker_account_mode != "same" && username_prefix.trim().is_empty() {
             return Err(ApiError::BadRequest(
-                "username_prefix cannot override USER_NAME when WORKER_ACCOUNT_MODE=same".into(),
+                "WORKER_USERNAME_PREFIX is required when WORKER_ACCOUNT_MODE is not same".into(),
             ));
         }
         let run_id_prefix = self
@@ -114,6 +119,7 @@ impl StartRequest {
             playlist_id,
             chunk_size,
             playlist_range,
+            random_order: self.random_order.unwrap_or(false),
         })
     }
 }
@@ -162,6 +168,7 @@ mod tests {
             chunk_size: None,
             playlist_range_start: None,
             playlist_range_end: None,
+            random_order: None,
         }
     }
 
@@ -185,12 +192,50 @@ mod tests {
     }
 
     #[test]
-    fn same_account_mode_rejects_username_override() {
+    fn same_account_mode_ignores_username_override() {
         let result =
             start_request(Some(1), Some("other")).validate(1, "real-user", 41000, "run", "same");
 
+        let validated = result.expect("same-account mode should ignore username override");
+        assert_eq!(validated.username_prefix, "real-user");
+    }
+
+    #[test]
+    fn random_order_defaults_to_false() {
+        let result = start_request(Some(1), None)
+            .validate(1, "real-user", 41000, "run", "same")
+            .expect("valid request");
+
+        assert!(!result.random_order);
+    }
+
+    #[test]
+    fn random_order_can_be_enabled() {
+        let mut request = start_request(Some(1), None);
+        request.random_order = Some(true);
+        let result = request
+            .validate(1, "real-user", 41000, "run", "same")
+            .expect("valid request");
+
+        assert!(result.random_order);
+    }
+
+    #[test]
+    fn suffixed_account_mode_accepts_multiple_workers() {
+        let result = start_request(Some(4), None)
+            .validate(4, "worker", 41000, "run", "suffixed")
+            .expect("valid suffixed-account request");
+
+        assert_eq!(result.worker_count, 4);
+        assert_eq!(result.username_prefix, "worker");
+    }
+
+    #[test]
+    fn suffixed_account_mode_requires_username_prefix() {
+        let result = start_request(Some(4), None).validate(4, "", 41000, "run", "suffixed");
+
         assert!(
-            matches!(result, Err(ApiError::BadRequest(message)) if message.contains("username_prefix"))
+            matches!(result, Err(ApiError::BadRequest(message)) if message.contains("WORKER_USERNAME_PREFIX"))
         );
     }
 }

@@ -11,6 +11,7 @@ pub async fn start_workers(
     state: web::Data<AppState>,
     req: web::Json<StartRequest>,
 ) -> ApiResult<HttpResponse> {
+    tracing::info!("Received worker start request");
     let request = req.into_inner().validate(
         state.config.worker_count,
         &state.config.username_prefix,
@@ -18,10 +19,49 @@ pub async fn start_workers(
         &state.config.run_id_prefix,
         &state.config.worker_account_mode,
     )?;
+    tracing::info!(
+        worker_count = request.worker_count,
+        port_base = request.port_base,
+        playlist_id = %request.playlist_id,
+        chunk_size = request.chunk_size,
+        random_order = request.random_order,
+        account_mode = %state.config.worker_account_mode,
+        worker_username = %request.username_prefix,
+        share_mode = %state.config.share_mode,
+        share_username = %state.config.share_username,
+        "Validated worker start request",
+    );
 
     let base_config = Config::try_from_env()
         .map_err(|err| ApiError::Internal(format!("Failed to load worker config: {err}")))?;
-    let user_password = std::env::var("USER_PASSWORD").unwrap_or_default();
+    if state
+        .config
+        .account_conflict_for(request.worker_count, &request.username_prefix)
+    {
+        tracing::warn!(
+            worker_username = %request.username_prefix,
+            share_username = %state.config.share_username,
+            "Rejecting worker start because worker and share accounts conflict",
+        );
+        return Err(ApiError::BadRequest(format!(
+            "SHARE_MODE=external requires different Soulseek accounts for workers ({}) and sharing service ({}). Set WORKER_USERNAME_PREFIX/WORKER_USER_PASSWORD for downloader accounts and SHARE_USER_NAME/SHARE_USER_PASSWORD for sharing.",
+            state
+                .config
+                .generated_worker_usernames(request.worker_count, &request.username_prefix)
+                .join(", "),
+            state.config.share_username
+        )));
+    }
+    if let Some(warning) = state
+        .config
+        .worker_port_capacity_warning_for(request.worker_count, request.port_base)
+    {
+        tracing::warn!(warning = %warning, "Rejecting worker start because configured worker ports exceed published range");
+        return Err(ApiError::BadRequest(format!(
+            "{warning} Increase WORKER_PORT_COUNT or reduce worker_count."
+        )));
+    }
+    let user_password = state.config.worker_password.clone();
 
     let spawned = state
         .worker_supervisor
@@ -35,6 +75,7 @@ pub async fn start_workers(
                 playlist_id: request.playlist_id,
                 chunk_size: request.chunk_size,
                 playlist_range: request.playlist_range,
+                random_order: request.random_order,
             },
             base_config,
             user_password,
@@ -42,6 +83,10 @@ pub async fn start_workers(
         .await
         .map_err(|err| ApiError::Internal(format!("Failed to start workers: {err}")))?;
 
+    tracing::info!(
+        spawned_workers = spawned.len(),
+        "Worker start request completed"
+    );
     Ok(HttpResponse::Ok().json(spawned))
 }
 

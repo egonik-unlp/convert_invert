@@ -23,7 +23,7 @@ pub struct Config {
 
 impl Config {
     pub fn try_from_env() -> anyhow::Result<Self> {
-        dotenvy::dotenv().ok();
+        load_dotenv_files();
         let run_id = env::var("RUN_ID").unwrap_or_else(|_| "default_run".to_string());
         let log_level: EnvFilter = env::var("LOG_LEVEL").unwrap_or("debug".to_string()).into();
         let user_name = env::var("USER_NAME").unwrap_or("default".to_string());
@@ -111,4 +111,9 @@ impl Config {
             share_path,
         }
     }
+}
+
+fn load_dotenv_files() {
+    dotenvy::dotenv().ok();
+    dotenvy::from_path("../.env").ok();
 }

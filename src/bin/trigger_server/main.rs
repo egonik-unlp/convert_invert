@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use actix_cors::Cors;
 use actix_governor::{Governor, GovernorConfigBuilder};
-use actix_web::middleware::from_fn;
+use actix_web::middleware::{DefaultHeaders, from_fn};
 use actix_web::{App, HttpServer, web};
 use anyhow::Context;
 use convert_invert::internals::context::context_manager::WorkerTuning;
@@ -123,6 +123,11 @@ async fn main() -> anyhow::Result<()> {
             .service(
                 web::scope("/api")
                     .wrap(from_fn(require_api_key))
+                    .wrap(
+                        DefaultHeaders::new()
+                            .add(("Cache-Control", "no-store"))
+                            .add(("Pragma", "no-cache")),
+                    )
                     .wrap(Governor::new(&global_governor))
                     .service(api::health)
                     .service(api::stats)
@@ -132,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
                     .service(api::playlists)
                     .service(api::playlist)
                     .service(api::candidates)
+                    .service(api::track_report)
                     .service(api::logs)
                     .service(
                         web::scope("/workers")
