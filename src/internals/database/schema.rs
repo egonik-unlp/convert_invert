@@ -61,6 +61,8 @@ diesel::table! {
         track -> Varchar,
         artist -> Varchar,
         album -> Varchar,
+        playlist_id -> Nullable<Varchar>,
+        playlist_name -> Nullable<Varchar>,
     }
 }
 

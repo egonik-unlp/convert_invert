@@ -138,7 +138,7 @@ impl WorkerSupervisor {
             shuffle_items(&mut items);
         }
 
-        self.persist_search_items(&items)
+        self.persist_search_items(&items, &options.playlist_id, &playlist_name)
             .context("Persist fetched playlist tracks")?;
 
         self.replace_queue(&options.playlist_id, options.chunk_size, &items)
@@ -247,8 +247,34 @@ impl WorkerSupervisor {
             }
         }
 
+        let no_workers_left = remaining.is_empty();
         *guard = remaining;
+        drop(guard);
+
+        // Stopping the whole sync (all workers gone) tears down its queue too, so leftover
+        // chunks don't sit around or get re-consumed. Best-effort — never fail the stop over it.
+        if no_workers_left {
+            self.clear_queue();
+        }
         Ok(stopped)
+    }
+
+    /// Delete the tracked chunk queue and any stray `dl:chunk_queue:*` keys so a stopped sync
+    /// leaves nothing queued behind.
+    fn clear_queue(&self) {
+        if let Ok(mut redis_con) = self.redis_pool.get() {
+            if let Ok(mut key_guard) = self.queue_key.lock()
+                && let Some(key) = key_guard.take()
+            {
+                let _: Result<usize, _> = redis_con.del(&key);
+            }
+            if let Ok(keys) = redis_con.scan_match::<_, String>("dl:chunk_queue:*") {
+                let keys: Vec<String> = keys.filter_map(Result::ok).collect();
+                for key in keys {
+                    let _: Result<usize, _> = redis_con.del(&key);
+                }
+            }
+        }
     }
 
     pub fn status(&self) -> anyhow::Result<WorkerStatus> {
@@ -288,16 +314,24 @@ impl WorkerSupervisor {
         })
     }
 
-    fn persist_search_items(&self, items: &[SearchItem]) -> anyhow::Result<()> {
+    fn persist_search_items(
+        &self,
+        items: &[SearchItem],
+        playlist_id: &str,
+        playlist_name: &str,
+    ) -> anyhow::Result<()> {
         let mut conn = self.db_pool.get().context("Acquire DB connection")?;
         let mut database_manager = DatabaseManager::new(&mut conn);
+        let pl_id = (!playlist_id.is_empty()).then(|| playlist_id.to_string());
+        let pl_name = (!playlist_name.is_empty()).then(|| playlist_name.to_string());
         for item in items {
             database_manager
-                .load_item_to_database(&Track::Query(item.clone()))
+                .upsert_search_item_with_playlist(item, pl_id.clone(), pl_name.clone())
                 .with_context(|| format!("Persist search item {}", item.track_id))?;
         }
         tracing::info!(
             track_count = items.len(),
+            playlist_id = %playlist_id,
             "Persisted fetched playlist tracks"
         );
         Ok(())

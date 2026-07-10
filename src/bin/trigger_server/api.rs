@@ -9,7 +9,7 @@ use convert_invert::internals::judge::judge_manager::JUDGE_THRESHOLD;
 use diesel::prelude::*;
 use diesel::sql_types::{Bool, Float4, Integer, Nullable, Text};
 use redis::Commands;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::errors::{ApiError, ApiResult};
 use crate::state::AppState;
@@ -439,6 +439,7 @@ struct RedisProgress {
     filename: Option<String>,
     username: Option<String>,
     track_db_id: Option<i32>,
+    judge_submission_id: Option<i32>,
     updated_at: Option<i64>,
 }
 
@@ -467,6 +468,9 @@ fn redis_progress_from_hash(data: &HashMap<String, String>) -> RedisProgress {
         username: data.get("username").cloned(),
         track_db_id: data
             .get("track_db_id")
+            .and_then(|value| value.parse::<i32>().ok()),
+        judge_submission_id: data
+            .get("judge_submission_id")
             .and_then(|value| value.parse::<i32>().ok()),
         updated_at: data
             .get("updated_at")
@@ -979,14 +983,59 @@ pub async fn config(state: web::Data<AppState>) -> impl actix_web::Responder {
     })
 }
 
+#[derive(QueryableByName)]
+struct PlaylistGroupRow {
+    #[diesel(sql_type = Text)]
+    id: String,
+    #[diesel(sql_type = Text)]
+    name: String,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    track_count: i64,
+}
+
+/// Special id used for tracks with no playlist tag (persisted before playlist tagging, or from
+/// direct-track syncs). The `/playlists/{id}` handler maps it to `playlist_id IS NULL`.
+const UNTAGGED_PLAYLIST_ID: &str = "untagged";
+
 #[get("/playlists")]
 pub async fn playlists(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
     let mut connection = state.db_pool.get()?;
-    let count = schema::search_items::table
-        .count()
-        .get_result::<i64>(&mut connection)
-        .unwrap_or(0);
-    Ok(HttpResponse::Ok().json(vec![playlist_summary(count, Vec::new(), None)]))
+    // One summary per distinct playlist so the library can be scoped per run instead of showing
+    // every run's tracks mixed together. NULL playlist_id groups under "untagged".
+    let rows = diesel::sql_query(
+        r#"
+        SELECT
+            COALESCE(playlist_id, '') AS id,
+            COALESCE(MAX(playlist_name), '') AS name,
+            COUNT(*) AS track_count
+        FROM search_items
+        GROUP BY COALESCE(playlist_id, '')
+        ORDER BY track_count DESC
+        "#,
+    )
+    .load::<PlaylistGroupRow>(&mut connection)?;
+
+    let summaries: Vec<PlaylistSummary> = rows
+        .into_iter()
+        .map(|row| {
+            let untagged = row.id.is_empty();
+            let mut summary = playlist_summary(row.track_count, Vec::new(), None);
+            summary.id = if untagged {
+                UNTAGGED_PLAYLIST_ID.to_string()
+            } else {
+                row.id.clone()
+            };
+            summary.name = if !row.name.is_empty() {
+                row.name
+            } else if untagged {
+                "Untagged".to_string()
+            } else {
+                row.id
+            };
+            summary
+        })
+        .collect();
+    Ok(HttpResponse::Ok().json(summaries))
 }
 
 #[get("/playlists/{id}")]
@@ -995,16 +1044,35 @@ pub async fn playlist(
     path: web::Path<String>,
     query: web::Query<PlaylistQuery>,
 ) -> ApiResult<HttpResponse> {
-    if path.as_str() != "all" {
-        return Err(ApiError::NotFound("Playlist not found"));
-    }
+    // Scope the library to one playlist. "all" = everything; "untagged" = tracks with no
+    // playlist tag; otherwise a Spotify playlist id (validated base62 so it is safe to inline).
+    let id = path.into_inner();
+    let playlist_filter = match id.as_str() {
+        "all" => String::new(),
+        UNTAGGED_PLAYLIST_ID => "AND si.playlist_id IS NULL".to_string(),
+        pid if !pid.is_empty() && pid.chars().all(|c| c.is_ascii_alphanumeric()) => {
+            format!("AND si.playlist_id = '{pid}'")
+        }
+        _ => return Err(ApiError::NotFound("Playlist not found")),
+    };
     let pagination = query.into_inner().validate()?;
     let mut connection = state.db_pool.get()?;
 
-    let total: i64 = schema::search_items::table
-        .count()
-        .get_result(&mut connection)
-        .unwrap_or(0);
+    let total: i64 = {
+        use schema::search_items::dsl as si;
+        match id.as_str() {
+            "all" => si::search_items.count().get_result(&mut connection),
+            UNTAGGED_PLAYLIST_ID => si::search_items
+                .filter(si::playlist_id.is_null())
+                .count()
+                .get_result(&mut connection),
+            pid => si::search_items
+                .filter(si::playlist_id.eq(pid))
+                .count()
+                .get_result(&mut connection),
+        }
+        .unwrap_or(0)
+    };
 
     let cursor_sql = if pagination.cursor.is_some() {
         "AND si.id < $1"
@@ -1062,7 +1130,7 @@ pub async fn playlist(
                 ELSE 'IN_QUEUE'
             END AS track_status
         FROM search_items si
-        WHERE 1=1 {cursor_sql}
+        WHERE 1=1 {playlist_filter} {cursor_sql}
         ORDER BY si.id DESC
         LIMIT {limit_param}
     "#
@@ -1899,6 +1967,94 @@ pub async fn pipeline_resume(state: web::Data<AppState>) -> ApiResult<HttpRespon
         downloads_paused: false,
         last_run: read_last_run(&state),
     }))
+}
+
+#[derive(Serialize)]
+pub struct ActiveDownload {
+    #[serde(rename = "judgeSubmissionId")]
+    pub judge_submission_id: i32,
+    #[serde(rename = "trackDbId", skip_serializing_if = "Option::is_none")]
+    pub track_db_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    pub progress: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[get("/downloads/active")]
+pub async fn active_downloads(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+    let mut con = state
+        .redis_pool
+        .get()
+        .map_err(|err| ApiError::Internal(format!("redis pool: {err}")))?;
+    let keys: Vec<String> = con
+        .scan_match::<_, String>("dl:*:progress")?
+        .collect::<Result<Vec<String>, _>>()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut out = Vec::new();
+    for key in keys {
+        let Some(js_from_key) = key.split(':').nth(1).and_then(|v| v.parse::<i32>().ok()) else {
+            continue;
+        };
+        let value_type: String = redis::cmd("TYPE").arg(&key).query(&mut con)?;
+        if value_type != "hash" {
+            continue;
+        }
+        let data: HashMap<String, String> = con.hgetall(&key)?;
+        let p = redis_progress_from_hash(&data);
+        if p.finished {
+            continue;
+        }
+        // Skip stale entries (dead worker) so cancelling only targets live transfers.
+        if let Some(updated_at) = p.updated_at
+            && now.saturating_sub(updated_at) > PROGRESS_STALE_SECS
+        {
+            continue;
+        }
+        out.push(ActiveDownload {
+            judge_submission_id: p.judge_submission_id.unwrap_or(js_from_key),
+            track_db_id: p.track_db_id,
+            filename: p.filename,
+            username: p.username,
+            progress: p.progress,
+            status: p.status,
+        });
+    }
+    out.sort_by_key(|b| std::cmp::Reverse(b.progress));
+    Ok(HttpResponse::Ok().json(out))
+}
+
+#[derive(Deserialize)]
+pub struct CancelDownloadBody {
+    pub id: i32,
+}
+
+#[post("/downloads/cancel")]
+pub async fn cancel_download(
+    state: web::Data<AppState>,
+    body: web::Json<CancelDownloadBody>,
+) -> ApiResult<HttpResponse> {
+    let mut con = state
+        .redis_pool
+        .get()
+        .map_err(|err| ApiError::Internal(format!("redis pool: {err}")))?;
+    let cancel_key = convert_invert::internals::download::download_manager::DOWNLOADS_CANCEL_KEY;
+    let _: i64 = con
+        .sadd(cancel_key, body.id.to_string())
+        .map_err(|err| ApiError::Internal(format!("redis sadd: {err}")))?;
+    // Bound the lifetime of the whole set so an id that is never consumed (e.g. the download had
+    // already finished) can't linger indefinitely; live downloads act on it within seconds.
+    let _: () = con
+        .expire(cancel_key, 3600)
+        .map_err(|err| ApiError::Internal(format!("redis expire: {err}")))?;
+    tracing::info!(judge_submission_id = body.id, "Download cancel requested");
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "cancelled": body.id })))
 }
 
 #[cfg(test)]

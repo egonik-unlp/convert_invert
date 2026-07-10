@@ -34,17 +34,10 @@ pub async fn start_workers(
 
     let base_config = Config::try_from_env()
         .map_err(|err| ApiError::Internal(format!("Failed to load worker config: {err}")))?;
-    // The Soulseek engine service owns the single login (search + download + share), so there
-    // is no longer a worker-vs-share account conflict to guard against.
-    if let Some(warning) = state
-        .config
-        .worker_port_capacity_warning_for(request.worker_count, request.port_base)
-    {
-        tracing::warn!(warning = %warning, "Rejecting worker start because configured worker ports exceed published range");
-        return Err(ApiError::BadRequest(format!(
-            "{warning} Increase WORKER_PORT_COUNT or reduce worker_count."
-        )));
-    }
+    // The aioslsk engine service owns the single Soulseek login and the single listen port
+    // (search + download + share). Workers are just parallel orchestration loops against that
+    // engine, so per-worker ports are vestigial and there is no account/port conflict to guard
+    // against — running multiple workers is safe and supported.
     let user_password = state.config.worker_password.clone();
 
     let spawned = state

@@ -49,11 +49,9 @@ impl StartRequest {
                 "worker_count must be 1..={MAX_WORKER_COUNT}"
             )));
         }
-        if worker_account_mode == "same" && worker_count != 1 {
-            return Err(ApiError::BadRequest(
-                "WORKER_ACCOUNT_MODE=same requires worker_count=1 because one downloader username is used without numeric suffixes".into(),
-            ));
-        }
+        // `same` mode no longer forces a single worker: all Soulseek I/O is delegated to the one
+        // aioslsk engine (a single login), so N workers are just parallel orchestration loops
+        // sharing it — the downloader username is vestigial and identical across them.
 
         let port_base = self.port_base.unwrap_or(default_port_base);
         if !(MIN_PORT_BASE..=MAX_PORT_BASE).contains(&port_base) {
@@ -183,12 +181,15 @@ mod tests {
     }
 
     #[test]
-    fn same_account_mode_rejects_multiple_workers() {
-        let result = start_request(Some(2), None).validate(1, "real-user", 41000, "run", "same");
+    fn same_account_mode_accepts_multiple_workers() {
+        // The aioslsk engine owns the single login, so N same-mode workers are safe (they are
+        // parallel orchestration loops sharing it); the downloader username stays identical.
+        let result = start_request(Some(2), None)
+            .validate(1, "real-user", 41000, "run", "same")
+            .expect("same-account mode should now accept multiple workers");
 
-        assert!(
-            matches!(result, Err(ApiError::BadRequest(message)) if message.contains("worker_count=1"))
-        );
+        assert_eq!(result.worker_count, 2);
+        assert_eq!(result.username_prefix, "real-user");
     }
 
     #[test]

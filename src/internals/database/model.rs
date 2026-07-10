@@ -27,6 +27,8 @@ pub struct SearchItemRow {
     pub track: String,
     pub artist: String,
     pub album: String,
+    pub playlist_id: Option<String>,
+    pub playlist_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Insertable)]
@@ -36,6 +38,8 @@ pub struct NewSearchItemRow {
     pub track: String,
     pub artist: String,
     pub album: String,
+    pub playlist_id: Option<String>,
+    pub playlist_name: Option<String>,
 }
 
 impl From<&RuntimeSearchItem> for NewSearchItemRow {
@@ -45,6 +49,23 @@ impl From<&RuntimeSearchItem> for NewSearchItemRow {
             track: value.track.clone(),
             artist: value.artist.clone(),
             album: value.album.clone(),
+            playlist_id: None,
+            playlist_name: None,
+        }
+    }
+}
+
+impl NewSearchItemRow {
+    /// Build an insert row tagged with the playlist that included this track.
+    pub fn with_playlist(
+        value: &RuntimeSearchItem,
+        playlist_id: Option<String>,
+        playlist_name: Option<String>,
+    ) -> Self {
+        Self {
+            playlist_id,
+            playlist_name,
+            ..Self::from(value)
         }
     }
 }

@@ -38,7 +38,7 @@ fn build_cors(allowed_origins: &[String]) -> Cors {
 
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
-    let mut app_config = config::load()?;
+    let app_config = config::load()?;
     let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "api".to_string());
     trace::otel_trace::init_tracing_with_otel("convert-invert-api".to_string(), run_id)
         .context("Tracing")?;
@@ -52,19 +52,10 @@ async fn main() -> anyhow::Result<()> {
         "Loaded worker/share configuration",
     );
 
-    // A8: `same` account mode logs a single Soulseek account in concurrently when
-    // worker_count > 1, which is a common ban/kick trigger (and the sharing sidecar already
-    // holds one session with the same credentials). Clamp to a single worker and warn; use
-    // real separate accounts (WORKER_ACCOUNT_MODE=suffixed) to run more.
-    if app_config.worker_account_mode == "same" && app_config.worker_count > 1 {
-        tracing::warn!(
-            requested_worker_count = app_config.worker_count,
-            "WORKER_ACCOUNT_MODE=same with worker_count > 1 risks a Soulseek ban; clamping \
-             worker_count to 1. Set WORKER_ACCOUNT_MODE=suffixed with real separate accounts \
-             to run multiple workers.",
-        );
-        app_config.worker_count = 1;
-    }
+    // Note: workers no longer each open a Soulseek session — all Soulseek I/O is delegated to
+    // the single aioslsk engine service (one login for search + download + share). So running
+    // multiple workers is just parallel orchestration against that one engine and is safe;
+    // the old "clamp WORKER_ACCOUNT_MODE=same to 1 worker" ban guard is obsolete and removed.
 
     let db_pool = convert_invert::internals::database::init_pool()?;
     let tuning = WorkerTuning::from_env();
@@ -148,6 +139,8 @@ async fn main() -> anyhow::Result<()> {
                     .service(api::network)
                     .service(api::config)
                     .service(api::downloads)
+                    .service(api::active_downloads)
+                    .service(api::cancel_download)
                     .service(api::pipeline_state)
                     .service(api::pipeline_pause)
                     .service(api::pipeline_resume)

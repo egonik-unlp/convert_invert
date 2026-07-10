@@ -21,6 +21,10 @@ use tokio::sync::{Semaphore, mpsc::Sender};
 /// `POST /api/pipeline/pause`, cleared via `/resume`; the download poll loop honours it.
 pub const DOWNLOADS_PAUSED_KEY: &str = "pipeline:downloads_paused";
 
+/// Redis SET of `judge_submission_id`s the user asked to cancel. `POST /api/downloads/cancel`
+/// adds one; the download poll loop aborts + drops that transfer and removes it from the set.
+pub const DOWNLOADS_CANCEL_KEY: &str = "dl:cancel";
+
 /// TTL applied to each `dl:*:progress` hash so an interrupted worker's entry self-expires
 /// instead of lingering as a phantom "downloading". Comfortably longer than any single attempt.
 const PROGRESS_TTL_SECS: i64 = 1800;
@@ -181,6 +185,13 @@ impl DownloadManager {
         };
         let key = format!("dl:{judge_submission_id}:progress");
 
+        // Clear any stale cancel flag left over from a previous attempt/run before we begin: the
+        // cancel set is keyed by judge_submission_id (stable across runs), and the in-loop cancel
+        // branch only removes it on the cancel path — so without this a leaked flag would
+        // instantly auto-cancel this fresh, un-cancelled download. The flag is only meaningful
+        // for a download that is already live, which this one is not yet.
+        clear_download_cancel(&redis_pool, judge_submission_id).await;
+
         push_progress(
             &redis_pool,
             &key,
@@ -252,6 +263,33 @@ impl DownloadManager {
                 last_progress = Instant::now();
                 last_redis = Instant::now();
                 continue;
+            }
+
+            // Manual per-download cancel: user asked to drop this one. Abort, clear the flag,
+            // and reject it (not retried) so it leaves the active pool and frees its slot.
+            if is_download_cancelled(&redis_pool, judge_submission_id).await {
+                self.abort(&username, &filename).await;
+                clear_download_cancel(&redis_pool, judge_submission_id).await;
+                push_progress(
+                    &redis_pool,
+                    &key,
+                    progress(
+                        &song,
+                        "cancelled",
+                        judge_submission_id,
+                        track_db_id,
+                        last_bytes.max(0) as u64,
+                        total_bytes,
+                        0.0,
+                        false,
+                    ),
+                )
+                .await;
+                tracing::info!(filename, "Download cancelled by user");
+                return Ok(Track::Reject(RejectedTrack::new(
+                    song.clone(),
+                    RejectReason::AbandonedAttemptingSearch,
+                )));
             }
 
             if hard_deadline.as_secs() != 0 && started.elapsed() > hard_deadline {
@@ -533,6 +571,32 @@ pub async fn is_downloads_paused(redis_pool: &RedisPool) -> bool {
     })
     .await
     .unwrap_or(false)
+}
+
+/// Whether the user requested cancellation of this download (its `judge_submission_id` is in the
+/// cancel set). Defaults to `false` if Redis is unavailable, off the async reactor.
+async fn is_download_cancelled(redis_pool: &RedisPool, judge_submission_id: i32) -> bool {
+    let redis_pool = redis_pool.clone();
+    tokio::task::spawn_blocking(move || -> bool {
+        let Ok(mut con) = redis_pool.get_timeout(Duration::from_secs(2)) else {
+            return false;
+        };
+        con.sismember(DOWNLOADS_CANCEL_KEY, judge_submission_id.to_string())
+            .unwrap_or(false)
+    })
+    .await
+    .unwrap_or(false)
+}
+
+/// Remove a download from the cancel set once it has been acted on.
+async fn clear_download_cancel(redis_pool: &RedisPool, judge_submission_id: i32) {
+    let redis_pool = redis_pool.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(mut con) = redis_pool.get_timeout(Duration::from_secs(2)) {
+            let _ = con.srem(DOWNLOADS_CANCEL_KEY, judge_submission_id.to_string());
+        }
+    })
+    .await;
 }
 
 /// Move a finished download into `dir`, keeping its file name. Prefers an atomic rename

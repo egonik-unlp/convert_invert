@@ -53,6 +53,31 @@ impl<'a> DatabaseManager<'a> {
         Ok(inserted_id)
     }
 
+    /// Insert a search item tagged with its originating playlist, updating the playlist tag on
+    /// conflict so a track re-included by a newer run is re-attributed to that run's playlist.
+    pub fn upsert_search_item_with_playlist(
+        &mut self,
+        search_item: &RuntimeSearchItem,
+        playlist_id: Option<String>,
+        playlist_name: Option<String>,
+    ) -> anyhow::Result<i32> {
+        use schema::search_items::dsl as sl;
+        let value = model::NewSearchItemRow::with_playlist(search_item, playlist_id, playlist_name);
+        insert_into(schema::search_items::table)
+            .values(&value)
+            .on_conflict(schema::search_items::track_id)
+            .do_update()
+            .set((
+                sl::playlist_id.eq(value.playlist_id.clone()),
+                sl::playlist_name.eq(value.playlist_name.clone()),
+            ))
+            .execute(self.connection)
+            .context("Upsert search item with playlist")?;
+        let inserted_id = Self::get_search_item_id(self.connection, search_item)
+            .context("Fetch upserted search item")?;
+        Ok(inserted_id)
+    }
+
     fn insert_downloadable_file(
         connection: &mut PgConnection,
         downloadable_file: &RuntimeDownloadableFile,
