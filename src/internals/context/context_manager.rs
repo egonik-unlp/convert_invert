@@ -1,6 +1,7 @@
 use crate::internals::database::manager::DatabaseManager;
 use futures_util::FutureExt;
 use rand::Rng;
+use redis::TypedCommands;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -8,7 +9,7 @@ use std::{
     panic::AssertUnwindSafe,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{
     Semaphore,
@@ -418,6 +419,61 @@ impl Managers {
     }
 }
 
+/// TTL (secs) on the live per-track activity marker in Redis. Short so a dead worker's marker
+/// disappears on its own; the API also treats older markers as stale.
+pub const ACTIVITY_STALE_SECS: i64 = 45;
+
+fn activity_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Mirror a track's current pipeline stage ("searching" / "judging") into Redis (`act:<track_id>`)
+/// so the dashboard can show live activity independent of the paginated library. Best-effort and
+/// off the async reactor; downloads are already tracked via `dl:*:progress`.
+async fn write_activity(
+    redis_pool: &RedisPool,
+    track_id: &str,
+    stage: &str,
+    title: &str,
+    artist: &str,
+) {
+    let redis_pool = redis_pool.clone();
+    let track_id = track_id.to_string();
+    let stage = stage.to_string();
+    let title = title.to_string();
+    let artist = artist.to_string();
+    let _ = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let mut con = redis_pool.get_timeout(Duration::from_secs(3))?;
+        let key = format!("act:{track_id}");
+        let values = [
+            ("stage".to_string(), stage),
+            ("title".to_string(), title),
+            ("artist".to_string(), artist),
+            ("track_id".to_string(), track_id.clone()),
+            ("updated_at".to_string(), activity_now_secs().to_string()),
+        ];
+        con.hset_multiple::<String, String, _>(key.clone(), &values)?;
+        con.expire(&key, ACTIVITY_STALE_SECS)?;
+        Ok(())
+    })
+    .await;
+}
+
+/// Remove a track's activity marker once it reaches a terminal stage (downloaded / rejected).
+async fn clear_activity(redis_pool: &RedisPool, track_id: &str) {
+    let redis_pool = redis_pool.clone();
+    let track_id = track_id.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Ok(mut con) = redis_pool.get_timeout(Duration::from_secs(3)) {
+            let _ = con.del(format!("act:{track_id}"));
+        }
+    })
+    .await;
+}
+
 async fn process_track(
     track: Track,
     shared: RunCycleShared<'_>,
@@ -474,6 +530,14 @@ async fn process_track(
                 );
                 return Ok(());
             }
+            write_activity(
+                &managers.redis_pool,
+                &search_item.track_id,
+                "searching",
+                &search_item.track,
+                &search_item.artist,
+            )
+            .await;
             let managers = Arc::clone(managers);
             let sender = Arc::clone(sender);
             let semaphore = search_semaphore.clone();
@@ -522,6 +586,14 @@ async fn process_track(
                 );
                 return Ok(());
             }
+            write_activity(
+                &managers.redis_pool,
+                &search_item.track_id,
+                "searching",
+                &search_item.track,
+                &search_item.artist,
+            )
+            .await;
             let managers = Arc::clone(managers);
             let sender = Arc::clone(sender);
             let semaphore = search_semaphore.clone();
@@ -548,6 +620,14 @@ async fn process_track(
             });
         }
         Track::Result(judge_submission) => {
+            write_activity(
+                &managers.redis_pool,
+                &judge_submission.track.track_id,
+                "judging",
+                &judge_submission.track.track,
+                &judge_submission.track.artist,
+            )
+            .await;
             let managers = Arc::clone(managers);
             let sender = Arc::clone(sender);
             spawn_managed(tasks, "judge", async move {
@@ -667,6 +747,7 @@ async fn process_track(
                 .await
                 .in_progress
                 .remove(&downloaded_file.track);
+            clear_activity(&managers.redis_pool, &downloaded_file.track.track_id).await;
             tracing::info!(?downloaded_file, "Downloaded file");
         }
         Track::Retry(mut retry_request) => {
@@ -751,6 +832,7 @@ async fn process_track(
         }
         Track::Reject(rejected_track) => {
             let (track, reason) = rejected_track.parts();
+            clear_activity(&managers.redis_pool, &track.track.track_id).await;
             emit_run_event(
                 events,
                 Some(RunEvent::Rejected {

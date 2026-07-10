@@ -33,6 +33,8 @@ pub struct StatsResponse {
     #[serde(rename = "totalTracks")]
     pub total_tracks: i64,
     pub pending: i64,
+    pub searching: usize,
+    pub judging: usize,
     pub downloading: usize,
     pub completed: i64,
     pub failed: i64,
@@ -892,6 +894,13 @@ pub async fn stats(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
                 .count()
         })
         .unwrap_or(0);
+    let (searching, judging) = activity_markers(&state.redis_pool)
+        .map(|markers| {
+            let searching = markers.iter().filter(|m| m.stage == "searching").count();
+            let judging = markers.iter().filter(|m| m.stage == "judging").count();
+            (searching, judging)
+        })
+        .unwrap_or((0, 0));
     let pending = (total_tracks - completed - failed).max(0);
     let global_progress = if total_tracks > 0 {
         ((completed as f64 / total_tracks as f64) * 100.0).round() as i64
@@ -902,6 +911,8 @@ pub async fn stats(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
     Ok(HttpResponse::Ok().json(StatsResponse {
         total_tracks,
         pending,
+        searching,
+        judging,
         downloading,
         completed,
         failed,
@@ -1984,19 +1995,22 @@ pub struct ActiveDownload {
     pub status: Option<String>,
 }
 
-#[get("/downloads/active")]
-pub async fn active_downloads(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
-    let mut con = state
-        .redis_pool
+fn now_secs_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Scan `dl:*:progress` for live (fresh, non-finished) transfers.
+fn collect_active_downloads(redis_pool: &RedisPool) -> ApiResult<Vec<ActiveDownload>> {
+    let mut con = redis_pool
         .get()
         .map_err(|err| ApiError::Internal(format!("redis pool: {err}")))?;
     let keys: Vec<String> = con
         .scan_match::<_, String>("dl:*:progress")?
         .collect::<Result<Vec<String>, _>>()?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let now = now_secs_i64();
     let mut out = Vec::new();
     for key in keys {
         let Some(js_from_key) = key.split(':').nth(1).and_then(|v| v.parse::<i32>().ok()) else {
@@ -2027,7 +2041,163 @@ pub async fn active_downloads(state: web::Data<AppState>) -> ApiResult<HttpRespo
         });
     }
     out.sort_by_key(|b| std::cmp::Reverse(b.progress));
-    Ok(HttpResponse::Ok().json(out))
+    Ok(out)
+}
+
+#[get("/downloads/active")]
+pub async fn active_downloads(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+    Ok(HttpResponse::Ok().json(collect_active_downloads(&state.redis_pool)?))
+}
+
+struct ActivityMarker {
+    track_id: String,
+    stage: String,
+    title: String,
+    artist: String,
+}
+
+/// Scan the live `act:<track_id>` markers (searching / judging), dropping stale ones.
+fn activity_markers(redis_pool: &RedisPool) -> ApiResult<Vec<ActivityMarker>> {
+    let mut con = redis_pool
+        .get()
+        .map_err(|err| ApiError::Internal(format!("redis pool: {err}")))?;
+    let keys: Vec<String> = con
+        .scan_match::<_, String>("act:*")?
+        .collect::<Result<Vec<String>, _>>()?;
+    let now = now_secs_i64();
+    let mut out = Vec::new();
+    for key in keys {
+        let value_type: String = redis::cmd("TYPE").arg(&key).query(&mut con)?;
+        if value_type != "hash" {
+            continue;
+        }
+        let data: HashMap<String, String> = con.hgetall(&key)?;
+        if let Some(updated_at) = data.get("updated_at").and_then(|v| v.parse::<i64>().ok())
+            && now.saturating_sub(updated_at)
+                > convert_invert::internals::context::context_manager::ACTIVITY_STALE_SECS
+        {
+            continue;
+        }
+        let stage = data.get("stage").cloned().unwrap_or_default();
+        if stage != "searching" && stage != "judging" {
+            continue;
+        }
+        out.push(ActivityMarker {
+            track_id: data
+                .get("track_id")
+                .cloned()
+                .unwrap_or_else(|| key.trim_start_matches("act:").to_string()),
+            stage,
+            title: data.get("title").cloned().unwrap_or_default(),
+            artist: data.get("artist").cloned().unwrap_or_default(),
+        });
+    }
+    Ok(out)
+}
+
+#[derive(Serialize)]
+pub struct ActivityItem {
+    #[serde(rename = "trackId", skip_serializing_if = "Option::is_none")]
+    pub track_id: Option<String>,
+    pub title: String,
+    pub artist: String,
+    pub stage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<i32>,
+    #[serde(rename = "judgeSubmissionId", skip_serializing_if = "Option::is_none")]
+    pub judge_submission_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ActivityResponse {
+    pub searching: Vec<ActivityItem>,
+    pub judging: Vec<ActivityItem>,
+    pub downloading: Vec<ActivityItem>,
+}
+
+#[get("/activity")]
+pub async fn activity(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+    let active = collect_active_downloads(&state.redis_pool)?;
+
+    // Titles/artists for the downloading tracks (progress hashes only carry the Soulseek path).
+    let track_db_ids: Vec<i32> = active.iter().filter_map(|d| d.track_db_id).collect();
+    let mut titles: HashMap<i32, (String, String, String)> = HashMap::new();
+    if !track_db_ids.is_empty() {
+        let mut connection = state.db_pool.get()?;
+        let rows: Vec<(i32, String, String, String)> = schema::search_items::table
+            .filter(schema::search_items::id.eq_any(&track_db_ids))
+            .select((
+                schema::search_items::id,
+                schema::search_items::track_id,
+                schema::search_items::track,
+                schema::search_items::artist,
+            ))
+            .load(&mut connection)
+            .unwrap_or_default();
+        for (id, track_id, title, artist) in rows {
+            titles.insert(id, (track_id, title, artist));
+        }
+    }
+
+    let downloading: Vec<ActivityItem> = active
+        .into_iter()
+        .map(|d| {
+            let meta = d.track_db_id.and_then(|id| titles.get(&id));
+            ActivityItem {
+                track_id: meta.map(|m| m.0.clone()),
+                title: meta.map(|m| m.1.clone()).unwrap_or_default(),
+                artist: meta.map(|m| m.2.clone()).unwrap_or_default(),
+                stage: "downloading",
+                progress: Some(d.progress),
+                judge_submission_id: Some(d.judge_submission_id),
+                filename: d.filename,
+                username: d.username,
+            }
+        })
+        .collect();
+
+    // Tracks already downloading shouldn't also appear as searching/judging.
+    let downloading_ids: HashSet<String> = downloading
+        .iter()
+        .filter_map(|d| d.track_id.clone())
+        .collect();
+
+    let mut searching = Vec::new();
+    let mut judging = Vec::new();
+    for marker in activity_markers(&state.redis_pool)? {
+        if downloading_ids.contains(&marker.track_id) {
+            continue;
+        }
+        let item = ActivityItem {
+            track_id: Some(marker.track_id),
+            title: marker.title,
+            artist: marker.artist,
+            stage: if marker.stage == "judging" {
+                "judging"
+            } else {
+                "searching"
+            },
+            progress: None,
+            judge_submission_id: None,
+            filename: None,
+            username: None,
+        };
+        if marker.stage == "judging" {
+            judging.push(item);
+        } else {
+            searching.push(item);
+        }
+    }
+
+    Ok(HttpResponse::Ok().json(ActivityResponse {
+        searching,
+        judging,
+        downloading,
+    }))
 }
 
 #[derive(Deserialize)]

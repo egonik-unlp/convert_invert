@@ -140,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
                     .service(api::config)
                     .service(api::downloads)
                     .service(api::active_downloads)
+                    .service(api::activity)
                     .service(api::cancel_download)
                     .service(api::pipeline_state)
                     .service(api::pipeline_pause)
