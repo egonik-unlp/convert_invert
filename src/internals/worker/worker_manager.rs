@@ -67,6 +67,9 @@ struct WorkerRunConfig {
     playlist_id: String,
     chunk_size: usize,
     download_path: PathBuf,
+    /// Sanitized playlist name; completed files land in `download_path/<download_subdir>` so
+    /// each playlist gets its own folder. Empty means "download straight into `download_path`".
+    download_subdir: String,
     redis_pool: RedisPool,
     db_pool: DbPool,
     is_leader: bool,
@@ -104,10 +107,12 @@ impl WorkerSupervisor {
             base_config.client_secret.clone(),
             base_config.search_timeout_secs,
         );
-        let playlist_tracks = query_manager
-            .fetch_playlist()
+        let (playlist_name, playlist_tracks) = query_manager
+            .fetch_playlist_with_name()
             .await
             .context("Fetch worker playlist")?;
+        let download_subdir = sanitize_folder_name(&playlist_name)
+            .unwrap_or_else(|| sanitize_folder_name(&options.playlist_id).unwrap_or_default());
         let playlist_tracks = apply_playlist_range(playlist_tracks, options.playlist_range);
         let mut items = playlist_tracks
             .into_iter()
@@ -143,6 +148,8 @@ impl WorkerSupervisor {
             max_search_passes_per_track = tuning.max_search_passes_per_track,
             max_requests_per_track = tuning.max_requests_per_track,
             playlist_id = %options.playlist_id,
+            playlist = %playlist_name,
+            download_subdir = %download_subdir,
             random_order = options.random_order,
             account_mode = %options.account_mode,
             username = %options.username_prefix,
@@ -176,6 +183,7 @@ impl WorkerSupervisor {
                 playlist_id: options.playlist_id.clone(),
                 chunk_size: options.chunk_size,
                 download_path: self.download_path.clone(),
+                download_subdir: download_subdir.clone(),
                 redis_pool: self.redis_pool.clone(),
                 db_pool: self.db_pool.clone(),
                 is_leader: index == 0,
@@ -295,6 +303,35 @@ pub fn chunk_queue_key(playlist_id: &str, chunk_size: usize) -> String {
     format!("dl:chunk_queue:{playlist_id}:{chunk_size}")
 }
 
+/// Turn a Spotify playlist name into a safe single-segment folder name: drop path separators
+/// and characters that are illegal on common filesystems, collapse whitespace, and cap the
+/// length. Returns `None` if nothing usable remains (caller falls back to the playlist id).
+pub fn sanitize_folder_name(name: &str) -> Option<String> {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => ' ',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    // Collapse runs of whitespace into single spaces and trim.
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Avoid leading/trailing dots (hidden files / Windows quirks) and cap the length.
+    let trimmed = collapsed.trim_matches('.').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        trimmed
+            .chars()
+            .take(120)
+            .collect::<String>()
+            .trim()
+            .to_string(),
+    )
+}
+
 pub fn build_chunks(items: &[SearchItem], chunk_size: usize) -> Vec<Vec<SearchItem>> {
     let chunk_size = chunk_size.max(1);
     let mut chunks = Vec::new();
@@ -363,6 +400,7 @@ async fn run_worker(config: WorkerRunConfig) {
         playlist_id,
         chunk_size,
         download_path,
+        download_subdir,
         redis_pool,
         db_pool,
         is_leader,
@@ -370,10 +408,17 @@ async fn run_worker(config: WorkerRunConfig) {
         mut shutdown,
     } = config;
 
+    // Completed files are organised into a per-playlist subfolder of the shared download dir.
+    let run_download_path = if download_subdir.is_empty() {
+        download_path.clone()
+    } else {
+        download_path.join(&download_subdir)
+    };
+
     let queue_key = chunk_queue_key(&playlist_id, chunk_size);
     let managers = match Managers::new(
         worker_config.judge_score_levenshtein,
-        download_path.clone(),
+        run_download_path.clone(),
         worker_config.clone(),
         db_pool.clone(),
         redis_pool.clone(),
@@ -481,7 +526,9 @@ async fn run_worker(config: WorkerRunConfig) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_playlist_range, build_chunks, chunk_queue_key, worker_info};
+    use super::{
+        apply_playlist_range, build_chunks, chunk_queue_key, sanitize_folder_name, worker_info,
+    };
     use crate::internals::context::context_manager::Track;
     use crate::internals::search::search_manager::SearchItem;
 
@@ -566,5 +613,40 @@ mod tests {
         assert_eq!(info.username, "real-user");
         assert_eq!(info.port, 41000);
         assert_eq!(info.run_id, "run-1");
+    }
+
+    #[test]
+    fn sanitize_folder_name_keeps_readable_names() {
+        assert_eq!(
+            sanitize_folder_name("My Chill Mix").as_deref(),
+            Some("My Chill Mix")
+        );
+    }
+
+    #[test]
+    fn sanitize_folder_name_strips_path_and_illegal_chars() {
+        assert_eq!(
+            sanitize_folder_name("Rock/Metal: the *best*?").as_deref(),
+            Some("Rock Metal the best"),
+        );
+        assert_eq!(
+            sanitize_folder_name("a\\b\"c<d>e|f").as_deref(),
+            Some("a b c d e f"),
+        );
+    }
+
+    #[test]
+    fn sanitize_folder_name_collapses_whitespace_and_trims_dots() {
+        assert_eq!(
+            sanitize_folder_name("  ..spaced   out..  ").as_deref(),
+            Some("spaced out"),
+        );
+    }
+
+    #[test]
+    fn sanitize_folder_name_returns_none_when_nothing_usable() {
+        assert_eq!(sanitize_folder_name("   "), None);
+        assert_eq!(sanitize_folder_name("///:::"), None);
+        assert_eq!(sanitize_folder_name(""), None);
     }
 }

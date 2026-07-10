@@ -46,6 +46,12 @@ impl QueryManager {
     }
 
     pub async fn fetch_playlist(self) -> anyhow::Result<Vec<Track>> {
+        Ok(self.fetch_playlist_with_name().await?.1)
+    }
+
+    /// Like [`Self::fetch_playlist`], but also returns the playlist's Spotify name so callers
+    /// can organise the downloaded files into a per-playlist folder.
+    pub async fn fetch_playlist_with_name(self) -> anyhow::Result<(String, Vec<Track>)> {
         let (client_id, client_secret) = self.spotify_client_credentials()?;
         let spotify = spotify_rs::ClientCredsClient::authenticate(client_id, client_secret)
             .await
@@ -56,6 +62,7 @@ impl QueryManager {
             .get(&spotify)
             .await
             .context("Fetch Spotify playlist")?;
+        let name = playlist.name.clone();
         let pl = playlist
             .tracks
             .get_all(&spotify)
@@ -74,8 +81,8 @@ impl QueryManager {
                 }
             })
             .collect::<Vec<_>>();
-        tracing::info!(track_count = pl.len(), "Fetched Spotify playlist");
-        Ok(pl)
+        tracing::info!(playlist = %name, track_count = pl.len(), "Fetched Spotify playlist");
+        Ok((name, pl))
     }
 
     pub async fn fetch_track(self) -> anyhow::Result<Track> {

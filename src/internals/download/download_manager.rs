@@ -11,7 +11,10 @@ use anyhow::Context;
 use redis::TypedCommands;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::{Semaphore, mpsc::Sender};
 
 /// Talks to the aioslsk engine service over HTTP: start a transfer, poll its status, and mirror
@@ -40,6 +43,10 @@ struct DownloadStatusBody {
     speed: f64,
     #[serde(default)]
     reason: Option<String>,
+    /// Absolute path the engine wrote the file to (in the shared `/downloads` volume). Used to
+    /// move the finished file into the per-playlist folder (`root_location`).
+    #[serde(default)]
+    path: Option<String>,
 }
 
 impl DownloadManager {
@@ -88,7 +95,6 @@ impl DownloadManager {
         let username = song.query.username.clone();
         let filename = song.query.filename.clone();
         let total_bytes = u64::try_from(song.query.size).unwrap_or_default();
-        let _ = &self.root_location; // downloads land in the engine's shared dir (same volume)
 
         // Resolve the DB ids for the progress key on a blocking thread (Diesel is sync).
         let (judge_submission_id, track_db_id) = {
@@ -208,6 +214,28 @@ impl DownloadManager {
             };
             match status.state.as_str() {
                 "COMPLETE" => {
+                    // The engine writes every file flat into the shared /downloads volume; move
+                    // the finished file into this run's per-playlist folder (root_location).
+                    // Same filesystem, so the rename is atomic; the engine still shares
+                    // /downloads recursively, so the file stays shared after moving.
+                    if let Some(src) = status.path.clone() {
+                        let dir = self.root_location.clone();
+                        match tokio::task::spawn_blocking(move || move_into_dir(&dir, &src)).await {
+                            Ok(Ok(dest)) => {
+                                tracing::info!(?dest, "Filed download into playlist folder")
+                            }
+                            Ok(Err(err)) => tracing::warn!(
+                                ?err,
+                                filename,
+                                "Could not move download into playlist folder; left in place"
+                            ),
+                            Err(err) => tracing::warn!(
+                                ?err,
+                                filename,
+                                "Move task panicked; download left in place"
+                            ),
+                        }
+                    }
                     push_progress(
                         &redis_pool,
                         &key,
@@ -362,6 +390,34 @@ impl DownloadManager {
     }
 }
 
+/// Move a finished download into `dir`, keeping its file name. Prefers an atomic rename
+/// (same filesystem), falling back to copy+remove across devices. No-op if it is already
+/// there. Returns the final path.
+fn move_into_dir(dir: &Path, src: &str) -> anyhow::Result<PathBuf> {
+    let src_path = PathBuf::from(src);
+    let file_name = src_path
+        .file_name()
+        .context("finished download has no file name")?;
+    let dest = dir.join(file_name);
+    if src_path == dest {
+        return Ok(dest);
+    }
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("creating playlist folder {}", dir.display()))?;
+    if let Err(rename_err) = std::fs::rename(&src_path, &dest) {
+        // Cross-device (or similar): fall back to copy + remove.
+        std::fs::copy(&src_path, &dest).with_context(|| {
+            format!(
+                "moving {} -> {} (rename failed: {rename_err})",
+                src_path.display(),
+                dest.display()
+            )
+        })?;
+        let _ = std::fs::remove_file(&src_path);
+    }
+    Ok(dest)
+}
+
 fn retry(song: &JudgeSubmission) -> Track {
     Track::Retry(RetryRequest {
         request: song.clone(),
@@ -456,7 +512,47 @@ fn write_progress(redis_pool: &RedisPool, key: &str, update: ProgressUpdate) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::move_into_dir;
     use crate::internals::search::search_manager::is_audio_file;
+    use std::path::PathBuf;
+
+    fn unique_tmp(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("civ_dl_test_{}_{tag}", std::process::id()))
+    }
+
+    #[test]
+    fn move_into_dir_relocates_into_playlist_folder() {
+        let base = unique_tmp("move");
+        let _ = std::fs::remove_dir_all(&base);
+        let src_dir = base.join("root");
+        let dest_dir = base.join("My Playlist");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("song.mp3");
+        std::fs::write(&src, b"audio").unwrap();
+
+        let dest = move_into_dir(&dest_dir, src.to_str().unwrap()).unwrap();
+
+        assert_eq!(dest, dest_dir.join("song.mp3"));
+        assert!(dest.exists());
+        assert!(!src.exists());
+        assert_eq!(std::fs::read(&dest).unwrap(), b"audio");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_into_dir_is_noop_when_already_there() {
+        let base = unique_tmp("noop");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let src = base.join("song.flac");
+        std::fs::write(&src, b"x").unwrap();
+
+        let dest = move_into_dir(&base, src.to_str().unwrap()).unwrap();
+
+        assert_eq!(dest, src);
+        assert!(src.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn audio_detection_accepts_supported_extensions_case_insensitively() {

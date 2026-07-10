@@ -1694,6 +1694,51 @@ pub struct DownloadedFile {
     pub name: String,
     pub size: u64,
     pub modified: u64,
+    /// Playlist folder the file lives in (`None` for files in the download root). Downloads are
+    /// organised into one folder per originating playlist.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+}
+
+/// Collect the audio-ish files directly inside `dir`, tagging each with `folder`. Not recursive
+/// beyond the one level the caller invokes it at.
+fn collect_download_files(
+    dir: &std::path::Path,
+    folder: Option<&str>,
+    out: &mut Vec<DownloadedFile>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_path = entry.path();
+        if !file_path.is_file() {
+            continue;
+        }
+        let name = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        if name.starts_with('.') {
+            continue;
+        }
+        let metadata = entry.metadata();
+        let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = metadata
+            .as_ref()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        out.push(DownloadedFile {
+            name,
+            size,
+            modified,
+            folder: folder.map(str::to_string),
+        });
+    }
 }
 
 #[get("/downloads")]
@@ -1705,35 +1750,21 @@ pub async fn downloads(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
         && path.is_dir()
         && let Ok(entries) = std::fs::read_dir(path)
     {
+        // Files at the root (e.g. downloads from before per-playlist foldering) plus one level
+        // of per-playlist subfolders.
+        collect_download_files(path, None, &mut files);
         for entry in entries.flatten() {
-            let file_path = entry.path();
-            if file_path.is_file() {
-                let name = file_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                if name.starts_with('.') {
-                    continue;
-                }
-
-                let metadata = entry.metadata();
-                let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
-                let modified = metadata
-                    .as_ref()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-
-                files.push(DownloadedFile {
-                    name,
-                    size,
-                    modified,
-                });
+            let sub = entry.path();
+            if !sub.is_dir() {
+                continue;
             }
+            let Some(folder) = sub.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if folder.starts_with('.') {
+                continue;
+            }
+            collect_download_files(&sub, Some(folder), &mut files);
         }
     }
 
