@@ -426,6 +426,11 @@ struct ExistsRow {
     exists: bool,
 }
 
+/// A progress hash is considered stale (its worker died, e.g. on an api restart) if it hasn't
+/// been updated in this many seconds. Active downloads refresh at least every ~5s, so this is a
+/// generous margin that still drops phantom "downloading" entries promptly.
+const PROGRESS_STALE_SECS: i64 = 120;
+
 #[derive(Default, Clone)]
 struct RedisProgress {
     progress: i32,
@@ -434,6 +439,7 @@ struct RedisProgress {
     filename: Option<String>,
     username: Option<String>,
     track_db_id: Option<i32>,
+    updated_at: Option<i64>,
 }
 
 fn redis_progress_from_hash(data: &HashMap<String, String>) -> RedisProgress {
@@ -462,6 +468,9 @@ fn redis_progress_from_hash(data: &HashMap<String, String>) -> RedisProgress {
         track_db_id: data
             .get("track_db_id")
             .and_then(|value| value.parse::<i32>().ok()),
+        updated_at: data
+            .get("updated_at")
+            .and_then(|value| value.parse::<i64>().ok()),
     }
 }
 
@@ -491,6 +500,10 @@ fn redis_progress_map(
     let keys: Vec<String> = redis_con
         .scan_match::<_, String>("dl:*:progress")?
         .collect::<Result<Vec<String>, _>>()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let mut progress = HashMap::new();
     for key in keys {
         let parts = key.split(':').collect::<Vec<_>>();
@@ -503,6 +516,13 @@ fn redis_progress_map(
         }
         let data: HashMap<String, String> = redis_con.hgetall(&key)?;
         let redis_progress = redis_progress_from_hash(&data);
+        // Skip stale entries: a worker that died (e.g. on an api restart) leaves its progress
+        // hash frozen in Redis, which would otherwise show forever as a phantom "downloading".
+        if let Some(updated_at) = redis_progress.updated_at
+            && now.saturating_sub(updated_at) > PROGRESS_STALE_SECS
+        {
+            continue;
+        }
         let track_id = redis_progress
             .track_db_id
             .or_else(|| correlations.get(&raw_id).copied())
@@ -1734,6 +1754,10 @@ fn collect_download_files(
         }
         let metadata = entry.metadata();
         let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
+        // Skip 0-byte stubs left behind by aborted/failed transfers — they are never real audio.
+        if size == 0 {
+            continue;
+        }
         let modified = metadata
             .as_ref()
             .ok()
@@ -1782,11 +1806,27 @@ pub async fn downloads(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
 }
 
 #[derive(Serialize)]
+pub struct LastRunResponse {
+    #[serde(rename = "playlistId")]
+    pub playlist_id: String,
+    #[serde(rename = "workerCount")]
+    pub worker_count: usize,
+    #[serde(rename = "chunkSize")]
+    pub chunk_size: usize,
+    #[serde(rename = "portBase")]
+    pub port_base: u16,
+}
+
+#[derive(Serialize)]
 pub struct PipelineState {
     /// Whether the manual stop toggle is engaged: workers keep running but downloads park
     /// (in-flight transfers abort and wait) until resumed. No track/candidate budget is spent.
     #[serde(rename = "downloadsPaused")]
     pub downloads_paused: bool,
+    /// The most recent run's parameters, so the UI can offer a one-click resume after the
+    /// in-memory workers are gone (e.g. after an api restart). `None` if nothing ran yet.
+    #[serde(rename = "lastRun", skip_serializing_if = "Option::is_none")]
+    pub last_run: Option<LastRunResponse>,
 }
 
 fn read_downloads_paused(state: &AppState) -> ApiResult<bool> {
@@ -1798,6 +1838,21 @@ fn read_downloads_paused(state: &AppState) -> ApiResult<bool> {
         .get(convert_invert::internals::download::download_manager::DOWNLOADS_PAUSED_KEY)
         .map_err(|err| ApiError::Internal(format!("redis get: {err}")))?;
     Ok(value.as_deref() == Some("1"))
+}
+
+fn read_last_run(state: &AppState) -> Option<LastRunResponse> {
+    let mut con = state.redis_pool.get().ok()?;
+    let raw: Option<String> = con
+        .get(convert_invert::internals::worker::worker_manager::LAST_RUN_KEY)
+        .ok()?;
+    let last_run: convert_invert::internals::worker::worker_manager::LastRun =
+        serde_json::from_str(&raw?).ok()?;
+    Some(LastRunResponse {
+        playlist_id: last_run.playlist_id,
+        worker_count: last_run.worker_count,
+        chunk_size: last_run.chunk_size,
+        port_base: last_run.port_base,
+    })
 }
 
 fn set_downloads_paused(state: &AppState, paused: bool) -> ApiResult<()> {
@@ -1822,6 +1877,7 @@ fn set_downloads_paused(state: &AppState, paused: bool) -> ApiResult<()> {
 pub async fn pipeline_state(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
     Ok(HttpResponse::Ok().json(PipelineState {
         downloads_paused: read_downloads_paused(&state)?,
+        last_run: read_last_run(&state),
     }))
 }
 
@@ -1831,6 +1887,7 @@ pub async fn pipeline_pause(state: web::Data<AppState>) -> ApiResult<HttpRespons
     tracing::info!("Downloads paused via manual stop toggle");
     Ok(HttpResponse::Ok().json(PipelineState {
         downloads_paused: true,
+        last_run: read_last_run(&state),
     }))
 }
 
@@ -1840,6 +1897,7 @@ pub async fn pipeline_resume(state: web::Data<AppState>) -> ApiResult<HttpRespon
     tracing::info!("Downloads resumed");
     Ok(HttpResponse::Ok().json(PipelineState {
         downloads_paused: false,
+        last_run: read_last_run(&state),
     }))
 }
 

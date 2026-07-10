@@ -21,6 +21,10 @@ use tokio::sync::{Semaphore, mpsc::Sender};
 /// `POST /api/pipeline/pause`, cleared via `/resume`; the download poll loop honours it.
 pub const DOWNLOADS_PAUSED_KEY: &str = "pipeline:downloads_paused";
 
+/// TTL applied to each `dl:*:progress` hash so an interrupted worker's entry self-expires
+/// instead of lingering as a phantom "downloading". Comfortably longer than any single attempt.
+const PROGRESS_TTL_SECS: i64 = 1800;
+
 pub const DEFAULT_DOWNLOAD_HARD_TIMEOUT_SECS: u64 = 180;
 pub const DEFAULT_DOWNLOAD_QUEUED_TIMEOUT_SECS: u64 = 45;
 pub const DEFAULT_DOWNLOAD_STALL_TIMEOUT_SECS: u64 = 30;
@@ -648,6 +652,11 @@ fn write_progress(redis_pool: &RedisPool, key: &str, update: ProgressUpdate) -> 
     redis_con
         .hset_multiple::<String, String, _>(key.to_string(), &values)
         .context("Write Redis download progress")?;
+    // Self-expiring so a worker that dies (e.g. on an api restart) can't leave a phantom
+    // "downloading" entry lingering forever. Live downloads refresh this well within the TTL.
+    redis_con
+        .expire(key, PROGRESS_TTL_SECS)
+        .context("Set TTL on download progress")?;
     Ok(())
 }
 

@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use rand::seq::SliceRandom;
 use redis::Commands;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -32,6 +32,19 @@ pub struct WorkerStatus {
     pub workers: Vec<WorkerInfo>,
     pub queue_len: usize,
     pub failed_count: usize,
+}
+
+/// Redis key holding the parameters of the most recent worker run, so the UI can offer a
+/// one-click "resume" after the (in-memory) workers are gone — e.g. after an api restart.
+pub const LAST_RUN_KEY: &str = "pipeline:last_run";
+
+/// Snapshot of a worker run persisted to Redis so it survives an api restart.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct LastRun {
+    pub playlist_id: String,
+    pub worker_count: usize,
+    pub chunk_size: usize,
+    pub port_base: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +143,20 @@ impl WorkerSupervisor {
 
         self.replace_queue(&options.playlist_id, options.chunk_size, &items)
             .context("Build worker queue")?;
+
+        // Persist the run parameters so the dashboard can offer a one-click resume even after an
+        // api restart clears the in-memory worker state. Best-effort: never fail a start over it.
+        if let Ok(mut redis_con) = self.redis_pool.get() {
+            let last_run = LastRun {
+                playlist_id: options.playlist_id.clone(),
+                worker_count: options.worker_count,
+                chunk_size: options.chunk_size,
+                port_base: options.port_base,
+            };
+            if let Ok(json) = serde_json::to_string(&last_run) {
+                let _ = redis_con.set::<_, _, ()>(LAST_RUN_KEY, json);
+            }
+        }
 
         let tuning = WorkerTuning::from_env();
         let last_port = options
