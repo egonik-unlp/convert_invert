@@ -108,8 +108,11 @@ pub fn load() -> anyhow::Result<AppConfig> {
         anyhow::bail!("API_KEY must be at least 16 characters");
     }
 
+    // Default covers both the docker-compose frontend (:5173) and the native Vite dev
+    // server (:3000). The blank-base-URL same-origin proxy path needs no CORS at all;
+    // these origins only matter for split-origin (cross-origin) setups.
     let allowed_origins: Vec<String> = std::env::var("ALLOWED_ORIGINS")
-        .unwrap_or_else(|_| "http://localhost:5173".to_string())
+        .unwrap_or_else(|_| "http://localhost:5173,http://localhost:3000".to_string())
         .split(',')
         .map(|origin| origin.trim().to_string())
         .filter(|origin| !origin.is_empty())

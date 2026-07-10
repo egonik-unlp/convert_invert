@@ -38,7 +38,7 @@ fn build_cors(allowed_origins: &[String]) -> Cors {
 
 #[actix_web::main]
 async fn main() -> anyhow::Result<()> {
-    let app_config = config::load()?;
+    let mut app_config = config::load()?;
     let run_id = std::env::var("RUN_ID").unwrap_or_else(|_| "api".to_string());
     trace::otel_trace::init_tracing_with_otel("convert-invert-api".to_string(), run_id)
         .context("Tracing")?;
@@ -51,6 +51,20 @@ async fn main() -> anyhow::Result<()> {
         share_path = %app_config.share_path,
         "Loaded worker/share configuration",
     );
+
+    // A8: `same` account mode logs a single Soulseek account in concurrently when
+    // worker_count > 1, which is a common ban/kick trigger (and the sharing sidecar already
+    // holds one session with the same credentials). Clamp to a single worker and warn; use
+    // real separate accounts (WORKER_ACCOUNT_MODE=suffixed) to run more.
+    if app_config.worker_account_mode == "same" && app_config.worker_count > 1 {
+        tracing::warn!(
+            requested_worker_count = app_config.worker_count,
+            "WORKER_ACCOUNT_MODE=same with worker_count > 1 risks a Soulseek ban; clamping \
+             worker_count to 1. Set WORKER_ACCOUNT_MODE=suffixed with real separate accounts \
+             to run multiple workers.",
+        );
+        app_config.worker_count = 1;
+    }
 
     let db_pool = convert_invert::internals::database::init_pool()?;
     let tuning = WorkerTuning::from_env();

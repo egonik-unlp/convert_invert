@@ -20,6 +20,8 @@ struct LogStats {
     duplicate_track_insert_errors: usize,
     retries: usize,
     budget_exhausted: usize,
+    already_downloaded_skips: usize,
+    retry_backoffs: usize,
     search_passes: usize,
     download_attempts: usize,
     empty_result_exits: usize,
@@ -157,6 +159,14 @@ impl LogStats {
         if text.contains("Request budget exhausted") {
             self.budget_exhausted += 1;
         }
+        // A1: searches skipped because the track was already downloaded (pure wasted-query
+        // savings). A2: jittered backoffs applied before a retry (only visible at debug level).
+        if text.contains("track already downloaded") {
+            self.already_downloaded_skips += 1;
+        }
+        if text.contains("Retry backoff") {
+            self.retry_backoffs += 1;
+        }
         if text.contains("Scheduling search") || text.contains("Scheduling relaxed retry search") {
             self.search_passes += 1;
         }
@@ -239,6 +249,11 @@ impl LogStats {
         );
         println!("  retry_requests: {}", self.retries);
         println!("  budget_exhausted: {}", self.budget_exhausted);
+        println!(
+            "  already_downloaded_skips: {}",
+            self.already_downloaded_skips
+        );
+        println!("  retry_backoffs: {}", self.retry_backoffs);
         println!("  search_passes: {}", self.search_passes);
         println!("  download_attempts: {}", self.download_attempts);
         println!("  empty_result_exits: {}", self.empty_result_exits);
@@ -408,6 +423,24 @@ mod tests {
         assert_eq!(stats.no_route_to_host, 1);
         assert_eq!(stats.download_timeouts, 1);
         assert_eq!(stats.retries, 1);
+    }
+
+    #[test]
+    fn counts_anti_ban_signals() {
+        let mut stats = LogStats::default();
+
+        stats.record(
+            r#"api-1 | {"level":"INFO","fields":{"message":"Skipping search; track already downloaded","track_id":"t1"}}"#,
+        );
+        stats.record(
+            r#"api-1 | {"level":"INFO","fields":{"message":"Skipping relaxed search; track already downloaded","track_id":"t2"}}"#,
+        );
+        stats.record(
+            r#"api-1 | {"level":"DEBUG","fields":{"message":"Retry backoff","delay_ms":1200}}"#,
+        );
+
+        assert_eq!(stats.already_downloaded_skips, 2);
+        assert_eq!(stats.retry_backoffs, 1);
     }
 
     #[test]

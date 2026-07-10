@@ -264,6 +264,12 @@ pub struct TuningConfig {
     pub max_search_passes_per_track: usize,
     #[serde(rename = "maxRequestsPerTrack")]
     pub max_requests_per_track: usize,
+    #[serde(rename = "retryBackoffMs")]
+    pub retry_backoff_ms: u64,
+    #[serde(rename = "searchPacingMs")]
+    pub search_pacing_ms: u64,
+    #[serde(rename = "peerCooldownSecs")]
+    pub peer_cooldown_secs: u64,
     #[serde(rename = "workerPortRange")]
     pub worker_port_range: String,
     #[serde(rename = "workerAccountMode")]
@@ -473,7 +479,12 @@ fn redis_progress_map(
         .collect::<HashMap<_, _>>();
 
     let mut redis_con = redis_pool.get()?;
-    let keys: Vec<String> = redis_con.keys("dl:*:progress")?;
+    // A6: SCAN (non-blocking, cursor-based) instead of KEYS (O(N), blocks the Redis server).
+    // This runs on every /stats and /downloads poll, so it must not stall Redis for other
+    // clients. `collect` drains the borrowing iterator before the connection is reused below.
+    let keys: Vec<String> = redis_con
+        .scan_match::<_, String>("dl:*:progress")?
+        .collect::<Result<Vec<String>, _>>()?;
     let mut progress = HashMap::new();
     for key in keys {
         let parts = key.split(':').collect::<Vec<_>>();
@@ -758,7 +769,7 @@ fn analyzed_trace_events(
         }
     }
 
-    events.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    events.sort_by_key(|left| left.timestamp);
     events.dedup_by(|left, right| {
         left.kind == right.kind && left.timestamp == right.timestamp && left.detail == right.detail
     });
@@ -915,6 +926,9 @@ pub async fn config(state: web::Data<AppState>) -> impl actix_web::Responder {
             candidate_collection_secs: tuning.candidate_collection_secs,
             max_search_passes_per_track: tuning.max_search_passes_per_track,
             max_requests_per_track: tuning.max_requests_per_track,
+            retry_backoff_ms: tuning.retry_backoff_ms,
+            search_pacing_ms: tuning.search_pacing_ms,
+            peer_cooldown_secs: tuning.peer_cooldown_secs,
             worker_port_range: format!("{}-{port_last}", state.config.port_base),
             worker_account_mode: state.config.worker_account_mode.clone(),
             worker_username: state.config.username_prefix.clone(),
@@ -1385,7 +1399,7 @@ pub async fn track_report(
         }
     }
 
-    lifecycle.sort_by(|left, right| left.timestamp.cmp(&right.timestamp));
+    lifecycle.sort_by_key(|left| left.timestamp);
     lifecycle.dedup_by(|left, right| {
         left.kind == right.kind && left.label == right.label && left.detail == right.detail
     });
@@ -1670,7 +1684,7 @@ pub async fn logs(state: web::Data<AppState>) -> impl actix_web::Responder {
             }
         }
     }
-    logs.sort_by(|left, right| right.timestamp.cmp(&left.timestamp));
+    logs.sort_by_key(|right| std::cmp::Reverse(right.timestamp));
     logs.truncate(50);
     HttpResponse::Ok().json(logs)
 }
@@ -1723,7 +1737,7 @@ pub async fn downloads(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
         }
     }
 
-    files.sort_by(|a, b| b.modified.cmp(&a.modified));
+    files.sort_by_key(|b| std::cmp::Reverse(b.modified));
     Ok(HttpResponse::Ok().json(files))
 }
 

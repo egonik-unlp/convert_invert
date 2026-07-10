@@ -1,5 +1,6 @@
 use crate::internals::database::manager::DatabaseManager;
 use futures_util::FutureExt;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use soulseek_rs::{Client, ClientSettings};
 use std::{
@@ -10,6 +11,7 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::sync::{
     Semaphore,
@@ -68,6 +70,8 @@ struct RunCycleShared<'a> {
     state: &'a Arc<tokio::sync::RwLock<RunState>>,
     search_semaphore: &'a Arc<Semaphore>,
     download_semaphore: &'a Arc<Semaphore>,
+    /// Tuning resolved once at chunk start; avoids re-reading env on every event.
+    tuning: WorkerTuning,
 }
 
 #[derive(Debug, Default)]
@@ -75,6 +79,9 @@ struct RunState {
     in_progress: HashSet<SearchItem>,
     candidate_pools: HashMap<SearchItem, CandidatePool>,
     request_budgets: HashMap<SearchItem, RequestBudget>,
+    /// Peer username -> instant at which its download cooldown expires. Peers are skipped
+    /// for new attempts while cooling down, so one flaky/hostile peer is not hammered.
+    peer_cooldowns: HashMap<String, Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -187,6 +194,15 @@ pub struct WorkerTuning {
     pub max_search_passes_per_track: usize,
     /// Max total Soulseek search/download requests per track.
     pub max_requests_per_track: usize,
+    /// Base backoff (ms) applied with full jitter before retrying a failed download or
+    /// search. Paces retries so we do not hammer flaky peers. `0` disables.
+    pub retry_backoff_ms: u64,
+    /// Base delay (ms) applied with full jitter before issuing each Soulseek search, to
+    /// pace outbound requests and reduce ban risk. `0` disables.
+    pub search_pacing_ms: u64,
+    /// Seconds a peer (Soulseek username) is skipped for new download attempts after one of
+    /// its transfers fails/times out, so a single bad peer is not hammered. `0` disables.
+    pub peer_cooldown_secs: u64,
 }
 
 impl WorkerTuning {
@@ -201,6 +217,9 @@ impl WorkerTuning {
             candidate_collection_secs: env_u64("CANDIDATE_COLLECTION_SECS", 20),
             max_search_passes_per_track: env_usize("MAX_SEARCH_PASSES_PER_TRACK", 2).max(1),
             max_requests_per_track: env_usize("MAX_REQUESTS_PER_TRACK", 8).max(1),
+            retry_backoff_ms: env_u64("RETRY_BACKOFF_MS", 1000),
+            search_pacing_ms: env_u64("SEARCH_PACING_MS", 500),
+            peer_cooldown_secs: env_u64("PEER_COOLDOWN_SECS", 120),
         }
     }
 }
@@ -350,6 +369,7 @@ impl Managers {
                         state: &state,
                         search_semaphore: &search_semaphore,
                         download_semaphore: &download_semaphore,
+                        tuning,
                     };
                     process_track(track, shared, &mut tasks).await?;
                 }
@@ -403,6 +423,7 @@ async fn process_track(
         state,
         search_semaphore,
         download_semaphore,
+        tuning,
     } = shared;
 
     emit_run_event(events, event_from_track(&track)).await;
@@ -426,7 +447,13 @@ async fn process_track(
     }
     match track {
         Track::Query(search_item) => {
-            let tuning = WorkerTuning::from_env();
+            if is_track_downloaded(managers, &search_item)? {
+                tracing::info!(
+                    track_id = %search_item.track_id,
+                    "Skipping search; track already downloaded",
+                );
+                return Ok(());
+            }
             let request_allowed = {
                 let mut state_guard = state.write().await;
                 spend_request(&mut state_guard, &search_item, &tuning, RequestKind::Search)
@@ -443,8 +470,10 @@ async fn process_track(
             let managers = Arc::clone(managers);
             let sender = Arc::clone(sender);
             let semaphore = search_semaphore.clone();
+            let pacing_ms = tuning.search_pacing_ms;
             tracing::debug!(?search_item, "Scheduling search");
             spawn_managed(tasks, "search", async move {
+                pace_request(pacing_ms).await;
                 let outcome = managers
                     .search_manager
                     .run(
@@ -466,7 +495,13 @@ async fn process_track(
             });
         }
         Track::SearchRetry(search_item) => {
-            let tuning = WorkerTuning::from_env();
+            if is_track_downloaded(managers, &search_item)? {
+                tracing::info!(
+                    track_id = %search_item.track_id,
+                    "Skipping relaxed search; track already downloaded",
+                );
+                return Ok(());
+            }
             let request_allowed = {
                 let mut state_guard = state.write().await;
                 spend_request(&mut state_guard, &search_item, &tuning, RequestKind::Search)
@@ -483,8 +518,10 @@ async fn process_track(
             let managers = Arc::clone(managers);
             let sender = Arc::clone(sender);
             let semaphore = search_semaphore.clone();
+            let pacing_ms = tuning.search_pacing_ms;
             tracing::debug!(?search_item, "Scheduling relaxed search retry");
             spawn_managed(tasks, "search_retry", async move {
+                pace_request(pacing_ms).await;
                 let outcome = managers
                     .search_manager
                     .run(
@@ -541,7 +578,6 @@ async fn process_track(
                     .context("sending already downloaded rejection")?;
                 return Ok(());
             }
-            let tuning = WorkerTuning::from_env();
             let mut state_guard = state.write().await;
             let pool = state_guard
                 .candidate_pools
@@ -573,7 +609,6 @@ async fn process_track(
             }
         }
         Track::SelectCandidate(search_item) => {
-            let tuning = WorkerTuning::from_env();
             let selection = {
                 let mut state_guard = state.write().await;
                 select_candidate(&mut state_guard, &search_item, &tuning)
@@ -603,6 +638,7 @@ async fn process_track(
                         Arc::clone(sender),
                         search_item,
                         "retry_search",
+                        tuning,
                     )
                     .await;
                 }
@@ -627,10 +663,20 @@ async fn process_track(
             tracing::info!(?downloaded_file, "Downloaded file");
         }
         Track::Retry(mut retry_request) => {
-            let tuning = WorkerTuning::from_env();
+            // A2: pace retries with a jittered backoff so flaky peers are not hammered.
+            backoff_before_retry(tuning.retry_backoff_ms).await;
             let next_selection = {
                 let mut state_guard = state.write().await;
                 state_guard.in_progress.remove(&retry_request.request.track);
+                // A3: cool the peer whose transfer just failed so we prefer other peers.
+                if tuning.peer_cooldown_secs > 0 {
+                    let cooled_until =
+                        Instant::now() + Duration::from_secs(tuning.peer_cooldown_secs);
+                    state_guard.peer_cooldowns.insert(
+                        retry_request.failed_download_result.username.clone(),
+                        cooled_until,
+                    );
+                }
                 if let Some(pool) = state_guard
                     .candidate_pools
                     .get_mut(&retry_request.request.track)
@@ -681,6 +727,7 @@ async fn process_track(
                 Arc::clone(sender),
                 original_request.track.clone(),
                 "retry_search",
+                tuning,
             )
             .await;
             if !scheduled {
@@ -774,6 +821,7 @@ fn schedule_download(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn schedule_relaxed_search(
     tasks: &mut JoinSet<ManagedTaskResult>,
     state: &Arc<tokio::sync::RwLock<RunState>>,
@@ -782,8 +830,8 @@ async fn schedule_relaxed_search(
     sender: Arc<Sender<Track>>,
     search_item: SearchItem,
     label: &'static str,
+    tuning: WorkerTuning,
 ) -> bool {
-    let tuning = WorkerTuning::from_env();
     let request_allowed = {
         let mut state_guard = state.write().await;
         spend_request(&mut state_guard, &search_item, &tuning, RequestKind::Search)
@@ -798,8 +846,10 @@ async fn schedule_relaxed_search(
         return false;
     }
     let managers = Arc::clone(managers);
+    let pacing_ms = tuning.search_pacing_ms;
     tracing::info!(?search_item, "Scheduling relaxed retry search");
     spawn_managed(tasks, label, async move {
+        pace_request(pacing_ms).await;
         managers
             .search_manager
             .run(
@@ -815,6 +865,53 @@ async fn schedule_relaxed_search(
         Ok(())
     });
     true
+}
+
+/// A1: returns true if the track already has a successful download recorded, so callers
+/// can skip re-searching Soulseek for it (the biggest source of wasted, ban-prone queries
+/// on re-runs and failed-track replays). Reuses [`DatabaseManager::is_search_item_downloaded`].
+fn is_track_downloaded(managers: &Arc<Managers>, item: &SearchItem) -> anyhow::Result<bool> {
+    let mut conn = managers.db_pool.get().map_err(|err| {
+        let snapshot = db_pool_snapshot(&managers.db_pool);
+        tracing::error!(
+            ?err,
+            db_pool_connections = snapshot.connections,
+            db_pool_idle_connections = snapshot.idle_connections,
+            db_pool_in_use_connections = snapshot.in_use_connections(),
+            "DB pool in pre-search downloaded check"
+        );
+        err
+    })?;
+    let mut database_manager = DatabaseManager::new(&mut conn);
+    database_manager
+        .is_search_item_downloaded(item)
+        .context("Pre-search downloaded check")
+}
+
+/// Returns a full-jitter duration in `[base_ms, 2*base_ms)`. `0` yields zero.
+fn jittered(base_ms: u64) -> Duration {
+    if base_ms == 0 {
+        return Duration::ZERO;
+    }
+    let extra = rand::rng().random_range(0..base_ms);
+    Duration::from_millis(base_ms + extra)
+}
+
+/// A2: jittered delay before issuing an outbound Soulseek search, to pace requests.
+async fn pace_request(base_ms: u64) {
+    let delay = jittered(base_ms);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// A2: jittered backoff before retrying a failed download/search.
+async fn backoff_before_retry(base_ms: u64) {
+    let delay = jittered(base_ms);
+    if !delay.is_zero() {
+        tracing::debug!(delay_ms = delay.as_millis() as u64, "Retry backoff");
+        tokio::time::sleep(delay).await;
+    }
 }
 
 fn spend_request(
@@ -861,6 +958,11 @@ fn select_candidate(
     if state.in_progress.contains(search_item) {
         return CandidateSelection::Wait;
     }
+    // A3: prune expired peer cooldowns and snapshot the still-cooling peers so we can
+    // prefer candidates from other peers without holding a borrow on `state`.
+    let now = Instant::now();
+    state.peer_cooldowns.retain(|_, until| *until > now);
+    let cooled: HashSet<String> = state.peer_cooldowns.keys().cloned().collect();
     let candidate = {
         let Some(pool) = state.candidate_pools.get_mut(search_item) else {
             return CandidateSelection::None;
@@ -869,7 +971,17 @@ fn select_candidate(
         let candidate = pool
             .candidates
             .iter()
-            .find(|candidate| !pool.failed.contains(&candidate.query))
+            // Prefer a non-failed candidate from a peer that is not cooling down; fall back
+            // to any non-failed candidate so a track is never stranded by cooldowns alone.
+            .find(|candidate| {
+                !pool.failed.contains(&candidate.query)
+                    && !cooled.contains(&candidate.query.username)
+            })
+            .or_else(|| {
+                pool.candidates
+                    .iter()
+                    .find(|candidate| !pool.failed.contains(&candidate.query))
+            })
             .cloned();
         if let Some(candidate) = candidate {
             if pool.attempts >= tuning.max_download_attempts_per_track {
@@ -978,6 +1090,7 @@ mod tests {
         push_candidate, select_candidate, spawn_managed, spend_request,
     };
     use crate::internals::search::search_manager::{DownloadableFile, JudgeSubmission, SearchItem};
+    use std::time::{Duration, Instant};
     use tokio::task::JoinSet;
 
     async fn next_result(tasks: &mut JoinSet<ManagedTaskResult>) -> ManagedTaskResult {
@@ -1031,6 +1144,9 @@ mod tests {
             candidate_collection_secs: 0,
             max_search_passes_per_track: 2,
             max_requests_per_track: 8,
+            retry_backoff_ms: 0,
+            search_pacing_ms: 0,
+            peer_cooldown_secs: 0,
         }
     }
 
@@ -1075,6 +1191,52 @@ mod tests {
         match select_candidate(&mut state, &search_item, &tuning(5)) {
             CandidateSelection::Download(candidate) => assert_eq!(candidate.query, second.query),
             _ => panic!("expected alternate download"),
+        }
+    }
+
+    #[test]
+    fn selection_prefers_peer_not_in_cooldown() {
+        let search_item = item();
+        let first = submission("first.flac", 0.9, 10);
+        let second = submission("second.flac", 0.8, 10);
+        let mut state = RunState::default();
+        let pool = state
+            .candidate_pools
+            .entry(search_item.clone())
+            .or_default();
+        push_candidate(pool, first.clone(), 5);
+        push_candidate(pool, second.clone(), 5);
+        // Cool down the top candidate's peer; selection should prefer the other peer.
+        state.peer_cooldowns.insert(
+            first.query.username.clone(),
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        match select_candidate(&mut state, &search_item, &tuning(5)) {
+            CandidateSelection::Download(candidate) => assert_eq!(candidate.query, second.query),
+            _ => panic!("expected the non-cooled peer to be selected"),
+        }
+    }
+
+    #[test]
+    fn selection_falls_back_to_cooled_peer_when_only_option() {
+        let search_item = item();
+        let only = submission("only.flac", 0.9, 10);
+        let mut state = RunState::default();
+        let pool = state
+            .candidate_pools
+            .entry(search_item.clone())
+            .or_default();
+        push_candidate(pool, only.clone(), 5);
+        // Even if the only candidate's peer is cooling down, the track must not be stranded.
+        state.peer_cooldowns.insert(
+            only.query.username.clone(),
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        match select_candidate(&mut state, &search_item, &tuning(5)) {
+            CandidateSelection::Download(candidate) => assert_eq!(candidate.query, only.query),
+            _ => panic!("expected fallback to the only (cooled) candidate"),
         }
     }
 
