@@ -17,6 +17,53 @@ use std::{
 };
 use tokio::sync::{Semaphore, mpsc::Sender};
 
+/// Redis key holding the manual pause toggle for the download stage. `"1"` = paused. Set via
+/// `POST /api/pipeline/pause`, cleared via `/resume`; the download poll loop honours it.
+pub const DOWNLOADS_PAUSED_KEY: &str = "pipeline:downloads_paused";
+
+pub const DEFAULT_DOWNLOAD_HARD_TIMEOUT_SECS: u64 = 180;
+pub const DEFAULT_DOWNLOAD_QUEUED_TIMEOUT_SECS: u64 = 45;
+pub const DEFAULT_DOWNLOAD_STALL_TIMEOUT_SECS: u64 = 30;
+
+/// Inactivity timeouts that free a download's concurrency slot instead of letting a dead peer
+/// clog the pipeline. `queued`/`stall` are the ones that matter for clogs (a peer parked in the
+/// remote queue, or connected but sending 0 bytes); `hard` is a generous absolute ceiling so a
+/// genuinely slow-but-progressing transfer is not killed. `0` disables that specific timeout.
+#[derive(Clone, Copy, Debug)]
+pub struct DownloadTimeouts {
+    /// Absolute ceiling for a single transfer attempt.
+    pub hard_secs: u64,
+    /// Max time a transfer may sit queued/initializing (not actively transferring).
+    pub queued_secs: u64,
+    /// Max time an active transfer may make no byte progress.
+    pub stall_secs: u64,
+}
+
+impl DownloadTimeouts {
+    pub fn from_env() -> Self {
+        fn env_u64(key: &str, default: u64) -> u64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        }
+        Self {
+            hard_secs: env_u64(
+                "DOWNLOAD_HARD_TIMEOUT_SECS",
+                DEFAULT_DOWNLOAD_HARD_TIMEOUT_SECS,
+            ),
+            queued_secs: env_u64(
+                "DOWNLOAD_QUEUED_TIMEOUT_SECS",
+                DEFAULT_DOWNLOAD_QUEUED_TIMEOUT_SECS,
+            ),
+            stall_secs: env_u64(
+                "DOWNLOAD_STALL_TIMEOUT_SECS",
+                DEFAULT_DOWNLOAD_STALL_TIMEOUT_SECS,
+            ),
+        }
+    }
+}
+
 /// Talks to the aioslsk engine service over HTTP: start a transfer, poll its status, and mirror
 /// progress into Redis. aioslsk connects OUT to reachable uploaders (server-brokered), so this
 /// works from behind NAT/CGNAT where the old inbound-only client stalled at 0 bytes.
@@ -24,6 +71,7 @@ pub struct DownloadManager {
     http: reqwest::Client,
     base_url: String,
     root_location: PathBuf,
+    timeouts: DownloadTimeouts,
 }
 
 #[derive(Serialize)]
@@ -50,11 +98,17 @@ struct DownloadStatusBody {
 }
 
 impl DownloadManager {
-    pub fn new(http: reqwest::Client, base_url: String, root_location: PathBuf) -> Self {
+    pub fn new(
+        http: reqwest::Client,
+        base_url: String,
+        root_location: PathBuf,
+        timeouts: DownloadTimeouts,
+    ) -> Self {
         DownloadManager {
             http,
             base_url,
             root_location,
+            timeouts,
         }
     }
 
@@ -139,32 +193,30 @@ impl DownloadManager {
         )
         .await;
 
+        // Manual stop toggle: if downloads are paused, wait here (before starting the transfer)
+        // until resumed. Parking without starting means no candidate/attempt budget is spent.
+        self.wait_while_paused(
+            &redis_pool,
+            &song,
+            judge_submission_id,
+            track_db_id,
+            total_bytes,
+        )
+        .await;
+
         // Kick off the transfer.
-        let start_resp = self
-            .http
-            .post(format!("{}/download", self.base_url))
-            .header("content-type", "application/json")
-            .body(
-                serde_json::to_string(&DownloadRef {
-                    username: &username,
-                    filename: &filename,
-                })
-                .unwrap_or_default(),
-            )
-            .send()
-            .await;
-        if let Err(err) = start_resp {
+        if let Err(err) = self.start_transfer(&username, &filename).await {
             tracing::warn!(?err, filename, "Failed to start transfer");
             return Ok(retry(&song));
         }
 
-        let hard_deadline = Duration::from_secs(3 * 60);
-        let max_queued = Duration::from_secs(90);
-        let max_no_progress = Duration::from_secs(45);
+        let hard_deadline = Duration::from_secs(self.timeouts.hard_secs);
+        let max_queued = Duration::from_secs(self.timeouts.queued_secs);
+        let max_no_progress = Duration::from_secs(self.timeouts.stall_secs);
         let poll_interval = Duration::from_secs(2);
         let log_every = Duration::from_secs(5);
 
-        let started = Instant::now();
+        let mut started = Instant::now();
         let mut queued_since: Option<Instant> = Some(Instant::now());
         let mut last_bytes: i64 = 0;
         let mut last_progress = Instant::now();
@@ -173,7 +225,32 @@ impl DownloadManager {
         loop {
             tokio::time::sleep(poll_interval).await;
 
-            if started.elapsed() > hard_deadline {
+            // Manual stop toggle: abort the live transfer, wait until resumed, then re-issue the
+            // *same* transfer and reset the inactivity clocks so the pause doesn't count against
+            // this attempt (no candidate burned, no peer cooldown, no track lost).
+            if is_downloads_paused(&redis_pool).await {
+                self.abort(&username, &filename).await;
+                self.wait_while_paused(
+                    &redis_pool,
+                    &song,
+                    judge_submission_id,
+                    track_db_id,
+                    total_bytes,
+                )
+                .await;
+                if let Err(err) = self.start_transfer(&username, &filename).await {
+                    tracing::warn!(?err, filename, "Failed to restart transfer after resume");
+                    return Ok(retry(&song));
+                }
+                started = Instant::now();
+                queued_since = Some(Instant::now());
+                last_bytes = 0;
+                last_progress = Instant::now();
+                last_redis = Instant::now();
+                continue;
+            }
+
+            if hard_deadline.as_secs() != 0 && started.elapsed() > hard_deadline {
                 self.abort(&username, &filename).await;
                 push_progress(
                     &redis_pool,
@@ -198,7 +275,7 @@ impl DownloadManager {
                 Ok(status) => status,
                 Err(err) => {
                     tracing::warn!(?err, filename, "Transfer status poll failed");
-                    if last_progress.elapsed() > max_no_progress {
+                    if max_no_progress.as_secs() != 0 && last_progress.elapsed() > max_no_progress {
                         self.abort(&username, &filename).await;
                         return Ok(retry(&song));
                     }
@@ -281,7 +358,9 @@ impl DownloadManager {
                     if bytes > last_bytes {
                         last_bytes = bytes;
                         last_progress = Instant::now();
-                    } else if last_progress.elapsed() > max_no_progress {
+                    } else if max_no_progress.as_secs() != 0
+                        && last_progress.elapsed() > max_no_progress
+                    {
                         self.abort(&username, &filename).await;
                         push_progress(
                             &redis_pool,
@@ -323,7 +402,7 @@ impl DownloadManager {
                 // QUEUED / INITIALIZING / VIRGIN / UNSET / PAUSED
                 _ => {
                     let waited = queued_since.get_or_insert_with(Instant::now);
-                    if waited.elapsed() > max_queued {
+                    if max_queued.as_secs() != 0 && waited.elapsed() > max_queued {
                         self.abort(&username, &filename).await;
                         push_progress(
                             &redis_pool,
@@ -388,6 +467,68 @@ impl DownloadManager {
             .send()
             .await;
     }
+
+    /// Ask the engine to start (or restart) a transfer.
+    async fn start_transfer(&self, username: &str, filename: &str) -> anyhow::Result<()> {
+        self.http
+            .post(format!("{}/download", self.base_url))
+            .header("content-type", "application/json")
+            .body(serde_json::to_string(&DownloadRef { username, filename }).unwrap_or_default())
+            .send()
+            .await
+            .context("start transfer request")?;
+        Ok(())
+    }
+
+    /// Block while the manual stop toggle is engaged, re-checking every ~1.5s. Publishes a
+    /// `paused` progress status once on entry so the UI reflects it. Returns as soon as resumed.
+    async fn wait_while_paused(
+        &self,
+        redis_pool: &RedisPool,
+        song: &JudgeSubmission,
+        judge_submission_id: i32,
+        track_db_id: i32,
+        total_bytes: u64,
+    ) {
+        if !is_downloads_paused(redis_pool).await {
+            return;
+        }
+        let key = format!("dl:{judge_submission_id}:progress");
+        push_progress(
+            redis_pool,
+            &key,
+            progress(
+                song,
+                "paused",
+                judge_submission_id,
+                track_db_id,
+                0,
+                total_bytes,
+                0.0,
+                false,
+            ),
+        )
+        .await;
+        tracing::info!(filename = %song.query.filename, "Download paused by manual stop toggle");
+        while is_downloads_paused(redis_pool).await {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+        }
+        tracing::info!(filename = %song.query.filename, "Download resumed");
+    }
+}
+
+/// Reads the manual pause toggle from Redis off the async reactor. Defaults to `false` (not
+/// paused) if Redis is unavailable, so a Redis hiccup never wedges the pipeline.
+pub async fn is_downloads_paused(redis_pool: &RedisPool) -> bool {
+    let redis_pool = redis_pool.clone();
+    tokio::task::spawn_blocking(move || -> bool {
+        let Ok(mut con) = redis_pool.get_timeout(Duration::from_secs(2)) else {
+            return false;
+        };
+        matches!(con.get(DOWNLOADS_PAUSED_KEY), Ok(Some(v)) if v == "1")
+    })
+    .await
+    .unwrap_or(false)
 }
 
 /// Move a finished download into `dir`, keeping its file name. Prefers an atomic rename

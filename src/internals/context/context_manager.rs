@@ -200,6 +200,13 @@ pub struct WorkerTuning {
     /// Seconds a peer (Soulseek username) is skipped for new download attempts after one of
     /// its transfers fails/times out, so a single bad peer is not hammered. `0` disables.
     pub peer_cooldown_secs: u64,
+    /// Absolute ceiling (secs) for a single download attempt before it is aborted. `0` disables.
+    pub download_hard_timeout_secs: u64,
+    /// Secs a download may sit queued/initializing (not transferring) before being aborted so it
+    /// stops occupying a concurrency slot. Main lever against a pipeline clog. `0` disables.
+    pub download_queued_timeout_secs: u64,
+    /// Secs an active download may make no byte progress before being aborted. `0` disables.
+    pub download_stall_timeout_secs: u64,
 }
 
 impl WorkerTuning {
@@ -217,6 +224,18 @@ impl WorkerTuning {
             retry_backoff_ms: env_u64("RETRY_BACKOFF_MS", 1000),
             search_pacing_ms: env_u64("SEARCH_PACING_MS", 500),
             peer_cooldown_secs: env_u64("PEER_COOLDOWN_SECS", 120),
+            download_hard_timeout_secs: env_u64(
+                "DOWNLOAD_HARD_TIMEOUT_SECS",
+                crate::internals::download::download_manager::DEFAULT_DOWNLOAD_HARD_TIMEOUT_SECS,
+            ),
+            download_queued_timeout_secs: env_u64(
+                "DOWNLOAD_QUEUED_TIMEOUT_SECS",
+                crate::internals::download::download_manager::DEFAULT_DOWNLOAD_QUEUED_TIMEOUT_SECS,
+            ),
+            download_stall_timeout_secs: env_u64(
+                "DOWNLOAD_STALL_TIMEOUT_SECS",
+                crate::internals::download::download_manager::DEFAULT_DOWNLOAD_STALL_TIMEOUT_SECS,
+            ),
         }
     }
 }
@@ -270,7 +289,10 @@ impl Managers {
             .context("building HTTP client for the Soulseek engine")?;
         let base_url = config.slsk_url.clone();
         let search_empty_result_cutoff = config.search_empty_result_cutoff;
-        let download_manager = DownloadManager::new(http.clone(), base_url.clone(), path);
+        let download_timeouts =
+            crate::internals::download::download_manager::DownloadTimeouts::from_env();
+        let download_manager =
+            DownloadManager::new(http.clone(), base_url.clone(), path, download_timeouts);
         let search_manager = SearchManager::new(http.clone(), base_url.clone());
         let judge_threshold =
             score.unwrap_or(crate::internals::judge::judge_manager::JUDGE_THRESHOLD);
@@ -1122,6 +1144,9 @@ mod tests {
             retry_backoff_ms: 0,
             search_pacing_ms: 0,
             peer_cooldown_secs: 0,
+            download_hard_timeout_secs: 180,
+            download_queued_timeout_secs: 45,
+            download_stall_timeout_secs: 30,
         }
     }
 

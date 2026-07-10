@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use actix_web::{HttpResponse, get, web};
+use actix_web::{HttpResponse, get, post, web};
 use convert_invert::internals::context::context_manager::RedisPool;
 use convert_invert::internals::context::context_manager::WorkerTuning;
 use convert_invert::internals::database::DbPool;
@@ -270,6 +270,12 @@ pub struct TuningConfig {
     pub search_pacing_ms: u64,
     #[serde(rename = "peerCooldownSecs")]
     pub peer_cooldown_secs: u64,
+    #[serde(rename = "downloadHardTimeoutSecs")]
+    pub download_hard_timeout_secs: u64,
+    #[serde(rename = "downloadQueuedTimeoutSecs")]
+    pub download_queued_timeout_secs: u64,
+    #[serde(rename = "downloadStallTimeoutSecs")]
+    pub download_stall_timeout_secs: u64,
     #[serde(rename = "workerPortRange")]
     pub worker_port_range: String,
     #[serde(rename = "workerAccountMode")]
@@ -929,6 +935,9 @@ pub async fn config(state: web::Data<AppState>) -> impl actix_web::Responder {
             retry_backoff_ms: tuning.retry_backoff_ms,
             search_pacing_ms: tuning.search_pacing_ms,
             peer_cooldown_secs: tuning.peer_cooldown_secs,
+            download_hard_timeout_secs: tuning.download_hard_timeout_secs,
+            download_queued_timeout_secs: tuning.download_queued_timeout_secs,
+            download_stall_timeout_secs: tuning.download_stall_timeout_secs,
             worker_port_range: format!("{}-{port_last}", state.config.port_base),
             worker_account_mode: state.config.worker_account_mode.clone(),
             worker_username: state.config.username_prefix.clone(),
@@ -1770,6 +1779,68 @@ pub async fn downloads(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
 
     files.sort_by_key(|b| std::cmp::Reverse(b.modified));
     Ok(HttpResponse::Ok().json(files))
+}
+
+#[derive(Serialize)]
+pub struct PipelineState {
+    /// Whether the manual stop toggle is engaged: workers keep running but downloads park
+    /// (in-flight transfers abort and wait) until resumed. No track/candidate budget is spent.
+    #[serde(rename = "downloadsPaused")]
+    pub downloads_paused: bool,
+}
+
+fn read_downloads_paused(state: &AppState) -> ApiResult<bool> {
+    let mut con = state
+        .redis_pool
+        .get()
+        .map_err(|err| ApiError::Internal(format!("redis pool: {err}")))?;
+    let value: Option<String> = con
+        .get(convert_invert::internals::download::download_manager::DOWNLOADS_PAUSED_KEY)
+        .map_err(|err| ApiError::Internal(format!("redis get: {err}")))?;
+    Ok(value.as_deref() == Some("1"))
+}
+
+fn set_downloads_paused(state: &AppState, paused: bool) -> ApiResult<()> {
+    let mut con = state
+        .redis_pool
+        .get()
+        .map_err(|err| ApiError::Internal(format!("redis pool: {err}")))?;
+    let key = convert_invert::internals::download::download_manager::DOWNLOADS_PAUSED_KEY;
+    if paused {
+        let _: () = con
+            .set(key, "1")
+            .map_err(|err| ApiError::Internal(format!("redis set: {err}")))?;
+    } else {
+        let _: () = con
+            .del(key)
+            .map_err(|err| ApiError::Internal(format!("redis del: {err}")))?;
+    }
+    Ok(())
+}
+
+#[get("/pipeline")]
+pub async fn pipeline_state(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+    Ok(HttpResponse::Ok().json(PipelineState {
+        downloads_paused: read_downloads_paused(&state)?,
+    }))
+}
+
+#[post("/pipeline/pause")]
+pub async fn pipeline_pause(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+    set_downloads_paused(&state, true)?;
+    tracing::info!("Downloads paused via manual stop toggle");
+    Ok(HttpResponse::Ok().json(PipelineState {
+        downloads_paused: true,
+    }))
+}
+
+#[post("/pipeline/resume")]
+pub async fn pipeline_resume(state: web::Data<AppState>) -> ApiResult<HttpResponse> {
+    set_downloads_paused(&state, false)?;
+    tracing::info!("Downloads resumed");
+    Ok(HttpResponse::Ok().json(PipelineState {
+        downloads_paused: false,
+    }))
 }
 
 #[cfg(test)]
