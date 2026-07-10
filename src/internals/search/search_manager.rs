@@ -4,18 +4,9 @@ use crate::internals::{
 };
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use soulseek_rs::SearchResult;
-use std::{
-    collections::HashSet,
-    fmt::Display,
-    sync::{Arc, atomic::AtomicBool},
-    time::Duration,
-};
-use tokio::{
-    sync::{Semaphore, mpsc::Sender},
-    time::sleep,
-};
-use tracing::{Instrument, info_span, instrument};
+use std::{fmt::Display, sync::Arc};
+use tokio::sync::{Semaphore, mpsc::Sender};
+use tracing::instrument;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchExitReason {
@@ -111,44 +102,44 @@ impl PartialEq for JudgeSubmission {
     }
 }
 
+#[derive(Serialize)]
+struct SearchRequestBody<'a> {
+    query: &'a str,
+    timeout: u8,
+    max_results: u32,
+}
+
+#[derive(Deserialize)]
+struct SearchResponseBody {
+    results: Vec<SlskCandidate>,
+}
+
+#[derive(Deserialize)]
+struct SlskCandidate {
+    username: String,
+    filename: String,
+    size: u64,
+}
+
+/// Searches Soulseek by delegating to the aioslsk engine service over HTTP. The service
+/// collects results for `timeout` seconds and returns audio candidates; we forward each as a
+/// `Track::Result` for judging. One login (in the service) covers search + download + share,
+/// and aioslsk's server-brokered connections make transfers work from behind NAT/CGNAT.
 pub struct SearchManager {
-    pub client: Arc<soulseek_rs::Client>,
+    http: reqwest::Client,
+    base_url: String,
 }
 
 impl SearchManager {
-    pub fn new(client: Arc<soulseek_rs::Client>) -> Self {
-        SearchManager { client }
+    pub fn new(http: reqwest::Client, base_url: String) -> Self {
+        SearchManager { http, base_url }
     }
-    fn build_submissions(track: SearchItem, result: SearchResult) -> Vec<JudgeSubmission> {
-        result
-            .files
-            .into_iter()
-            .filter(|file| is_audio_file(&file.name))
-            .filter_map(|f| {
-                let size = match downloadable_size(f.size) {
-                    Some(size) => size,
-                    None => {
-                        tracing::warn!(
-                            filename = f.name,
-                            size = f.size,
-                            "Skipping search result with size too large for storage"
-                        );
-                        return None;
-                    }
-                };
-                Some(JudgeSubmission {
-                    query: DownloadableFile {
-                        filename: f.name,
-                        size,
-                        username: f.username,
-                    },
-                    track: track.clone(),
-                    score: None,
-                    relative_mi_score: None,
-                })
-            })
-            .collect()
-    }
+
+    #[instrument(
+        name = "track_search_task",
+        skip(self, semaphore, sender),
+        fields(id = %track.track_id, query = %track.track),
+    )]
     pub async fn run(
         &self,
         track: SearchItem,
@@ -158,132 +149,85 @@ impl SearchManager {
         semaphore: Arc<Semaphore>,
         sender: Arc<Sender<Track>>,
     ) -> anyhow::Result<SearchOutcome> {
-        let client = self.client.clone();
+        let _ = count_cutoff; // the engine service owns the collection window now
         let _permit = semaphore.acquire().await.context("Getting permit")?;
-        let outcome = track_search_task(
-            client,
-            track,
-            count_cutoff,
-            timeout_secs,
-            relaxed_query,
-            sender,
-        )
-        .await
-        .context("TST")?;
-        Ok(outcome)
-    }
-}
 
-#[instrument(
-    name = "track_search_task",
-    skip(client ),
-    fields(
-        id = data.track_id,
-        query = ?data.track,
-    )
-)]
-pub async fn track_search_task(
-    client: Arc<soulseek_rs::Client>,
-    data: SearchItem,
-    count_cutoff: usize,
-    timeout_secs: u8,
-    relaxed_query: bool,
-    sender: Arc<Sender<Track>>,
-) -> anyhow::Result<SearchOutcome> {
-    let query_string = if relaxed_query {
-        data.track.clone()
-    } else {
-        format!("{} - {}", data.track.as_str(), data.artist)
-    };
-    let search_timeout = Duration::from_secs(u64::from(timeout_secs.max(1)));
-    let cancel = Arc::new(AtomicBool::new(false));
-    let span = info_span!("track_blocking");
-    let search_thread = {
-        let search_client = client.clone();
-        let query_string_search = query_string.clone();
-        let cancel_search = cancel.clone();
-        tokio::task::spawn_blocking(move || {
-            search_client.search_with_cancel(
-                query_string_search.as_str(),
-                search_timeout,
-                Some(cancel_search),
-            )
-        })
-    }
-    .instrument(span);
-    let mut previous_submissions = HashSet::new();
-    let mut count = 0;
-    let mut total_files_found = 0;
-    let mut candidates_sent = 0usize;
-    let poll_interval = Duration::from_secs(u64::from(timeout_secs.clamp(1, 3)));
-    'main: loop {
-        sleep(poll_interval).await;
-        let results = client.get_search_results(&query_string);
-        let current_total_files: usize = results.iter().map(|res| res.files.len()).sum();
-
-        if current_total_files > total_files_found {
-            for result in results {
-                let submissions = SearchManager::build_submissions(data.clone(), result);
-                for submission in submissions {
-                    let key = (
-                        submission.query.filename.clone(),
-                        submission.query.username.clone(),
-                    );
-                    if !previous_submissions.contains(&key) {
-                        send(Track::Result(submission.clone()), &sender)
-                            .await
-                            .context("Sending result")?;
-                        previous_submissions.insert(key);
-                        candidates_sent += 1;
-                    }
-                }
-            }
-            total_files_found = current_total_files;
-            count = 0;
+        let query_string = if relaxed_query {
+            track.track.clone()
         } else {
-            count += 1;
+            format!("{} - {}", track.track.as_str(), track.artist)
+        };
+
+        let body = serde_json::to_string(&SearchRequestBody {
+            query: &query_string,
+            timeout: timeout_secs.max(1),
+            max_results: 200,
+        })
+        .context("serialize search request")?;
+
+        let response = self
+            .http
+            .post(format!("{}/search", self.base_url))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .context("search request to engine")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            tracing::warn!(%status, %query_string, relaxed_query, detail = %text, "Engine search failed");
+            return Ok(SearchOutcome {
+                exit_reason: SearchExitReason::Cancelled,
+                candidates_sent: 0,
+            });
         }
-        if count > count_cutoff {
-            tracing::info!(
-                times = count_cutoff,
-                query_string = query_string,
-                relaxed_query,
-                exit_reason = if candidates_sent == 0 {
-                    "NoCandidatesFound"
-                } else {
-                    "EmptyAfterPeerErrors"
+        let text = response.text().await.context("read search body")?;
+        let parsed: SearchResponseBody =
+            serde_json::from_str(&text).context("parse search body")?;
+
+        let mut candidates_sent = 0usize;
+        for candidate in parsed.results {
+            if !is_audio_file(&candidate.filename) {
+                continue;
+            }
+            let Some(size) = downloadable_size(candidate.size) else {
+                continue;
+            };
+            let submission = JudgeSubmission {
+                query: DownloadableFile {
+                    filename: candidate.filename,
+                    username: candidate.username,
+                    size,
                 },
+                track: track.clone(),
+                score: None,
+                relative_mi_score: None,
+            };
+            send(Track::Result(submission), &sender)
+                .await
+                .context("Sending result")?;
+            candidates_sent += 1;
+        }
+
+        if candidates_sent == 0 {
+            tracing::info!(
+                query_string,
+                relaxed_query,
+                exit_reason = "NoCandidatesFound",
                 "Exited because consecutive empty results",
             );
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-            break 'main;
         }
-    }
-    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    let search_result = search_thread
-        .await
-        .context("Search thread join failed")?
-        .context("Inner search thread issue");
-    if let Err(err) = search_result {
-        tracing::warn!(
-            ?err,
-            query_string,
-            relaxed_query,
-            "Search task cancelled or failed"
-        );
-        return Ok(SearchOutcome {
-            exit_reason: SearchExitReason::Cancelled,
+
+        Ok(SearchOutcome {
+            exit_reason: if candidates_sent == 0 {
+                SearchExitReason::NoCandidatesFound
+            } else {
+                SearchExitReason::EmptyAfterPeerErrors
+            },
             candidates_sent,
-        });
+        })
     }
-    Ok(SearchOutcome {
-        exit_reason: if candidates_sent == 0 {
-            SearchExitReason::NoCandidatesFound
-        } else {
-            SearchExitReason::EmptyAfterPeerErrors
-        },
-        candidates_sent,
-    })
 }
 
 #[cfg(test)]

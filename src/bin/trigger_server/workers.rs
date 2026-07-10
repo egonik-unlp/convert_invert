@@ -34,24 +34,8 @@ pub async fn start_workers(
 
     let base_config = Config::try_from_env()
         .map_err(|err| ApiError::Internal(format!("Failed to load worker config: {err}")))?;
-    if state
-        .config
-        .account_conflict_for(request.worker_count, &request.username_prefix)
-    {
-        tracing::warn!(
-            worker_username = %request.username_prefix,
-            share_username = %state.config.share_username,
-            "Rejecting worker start because worker and share accounts conflict",
-        );
-        return Err(ApiError::BadRequest(format!(
-            "SHARE_MODE=external requires different Soulseek accounts for workers ({}) and sharing service ({}). Set WORKER_USERNAME_PREFIX/WORKER_USER_PASSWORD for downloader accounts and SHARE_USER_NAME/SHARE_USER_PASSWORD for sharing.",
-            state
-                .config
-                .generated_worker_usernames(request.worker_count, &request.username_prefix)
-                .join(", "),
-            state.config.share_username
-        )));
-    }
+    // The Soulseek engine service owns the single login (search + download + share), so there
+    // is no longer a worker-vs-share account conflict to guard against.
     if let Some(warning) = state
         .config
         .worker_port_capacity_warning_for(request.worker_count, request.port_base)

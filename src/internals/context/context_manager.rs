@@ -2,13 +2,10 @@ use crate::internals::database::manager::DatabaseManager;
 use futures_util::FutureExt;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use soulseek_rs::{Client, ClientSettings};
 use std::{
-    any::Any,
     collections::{HashMap, HashSet},
     future::Future,
-    net::TcpListener,
-    panic::{AssertUnwindSafe, catch_unwind},
+    panic::AssertUnwindSafe,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -240,8 +237,6 @@ fn env_u64(key: &str, default: u64) -> u64 {
 
 /// The central container for all service managers and shared state.
 pub struct Managers {
-    /// The shared Soulseek client.
-    pub client: Arc<Client>,
     /// Manager for file downloads.
     pub download_manager: DownloadManager,
     /// Manager for Soulseek searches.
@@ -266,24 +261,17 @@ impl Managers {
         db_pool: crate::internals::database::DbPool,
         redis_pool: RedisPool,
     ) -> anyhow::Result<Self> {
-        let listen_port = config.listen_port;
-        TcpListener::bind(format!("0.0.0.0:{listen_port}"))
-            .with_context(|| format!("listener bind preflight failed on port {listen_port}"))?;
-        let client_settings = ClientSettings {
-            username: config.user_name,
-            password: config.user_password,
-            listen_port,
-            ..Default::default()
-        };
+        // Soulseek I/O (search + download + share) is delegated to the aioslsk engine service
+        // over HTTP. A single login there covers everything, and aioslsk's server-brokered
+        // connections make transfers work from behind NAT/CGNAT.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .context("building HTTP client for the Soulseek engine")?;
+        let base_url = config.slsk_url.clone();
         let search_empty_result_cutoff = config.search_empty_result_cutoff;
-        let mut client = Client::with_settings(client_settings);
-        catch_unwind(AssertUnwindSafe(|| client.connect())).map_err(|payload| {
-            anyhow::anyhow!("listener bind panic: {}", panic_payload(payload))
-        })?;
-        client.login().context("Could not connect")?;
-        let client = Arc::new(client);
-        let download_manager = DownloadManager::new(client.clone(), path);
-        let search_manager = SearchManager::new(client.clone());
+        let download_manager = DownloadManager::new(http.clone(), base_url.clone(), path);
+        let search_manager = SearchManager::new(http.clone(), base_url.clone());
         let judge_threshold =
             score.unwrap_or(crate::internals::judge::judge_manager::JUDGE_THRESHOLD);
         let lev_judge = Levenshtein::new(judge_threshold);
@@ -295,7 +283,6 @@ impl Managers {
             config.search_timeout_secs,
         );
         Ok(Managers {
-            client,
             download_manager,
             search_manager,
             judge_manager,
@@ -405,9 +392,7 @@ impl Managers {
     }
 
     pub fn shutdown(self: Arc<Self>) {
-        tracing::info!(
-            "Managers shutdown requested; soulseek-rs-lib 0.3.0 exposes no public disconnect/logout API",
-        );
+        tracing::info!("Managers shutdown; the Soulseek engine runs as a separate service");
     }
 }
 
@@ -1045,16 +1030,6 @@ fn quality_rank(filename: &str) -> u8 {
         1
     } else {
         0
-    }
-}
-
-fn panic_payload(payload: Box<dyn Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_string()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown panic payload".to_string()
     }
 }
 

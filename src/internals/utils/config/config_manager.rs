@@ -19,6 +19,8 @@ pub struct Config {
     pub client_secret: Option<String>,
     pub share_mode: String,
     pub share_path: String,
+    /// Base URL of the aioslsk engine service that performs search + download + share.
+    pub slsk_url: String,
 }
 
 impl Config {
@@ -58,6 +60,7 @@ impl Config {
         };
         let share_mode = env::var("SHARE_MODE").unwrap_or_else(|_| "disabled".to_string());
         let share_path = env::var("SHARE_PATH").unwrap_or_else(|_| "/downloads".to_string());
+        let slsk_url = env::var("SLSK_URL").unwrap_or_else(|_| "http://sharing:8080".to_string());
 
         Ok(Config {
             run_id,
@@ -74,6 +77,7 @@ impl Config {
             client_secret,
             share_mode,
             share_path,
+            slsk_url,
         })
     }
 
@@ -109,6 +113,7 @@ impl Config {
             client_secret,
             share_mode,
             share_path,
+            slsk_url: "http://sharing:8080".to_string(),
         }
     }
 }
