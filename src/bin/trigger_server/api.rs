@@ -1894,6 +1894,8 @@ pub struct LastRunResponse {
     pub chunk_size: usize,
     #[serde(rename = "portBase")]
     pub port_base: u16,
+    #[serde(rename = "resourceKind")]
+    pub resource_kind: String,
 }
 
 #[derive(Serialize)]
@@ -1926,11 +1928,19 @@ fn read_last_run(state: &AppState) -> Option<LastRunResponse> {
         .ok()?;
     let last_run: convert_invert::internals::worker::worker_manager::LastRun =
         serde_json::from_str(&raw?).ok()?;
+    // Snapshots persisted before per-resource syncs existed have an empty kind; treat those as
+    // playlists so the UI resumes them the way they originally ran.
+    let resource_kind = if last_run.resource_kind.trim().is_empty() {
+        "playlist".to_string()
+    } else {
+        last_run.resource_kind
+    };
     Some(LastRunResponse {
         playlist_id: last_run.playlist_id,
         worker_count: last_run.worker_count,
         chunk_size: last_run.chunk_size,
         port_base: last_run.port_base,
+        resource_kind,
     })
 }
 

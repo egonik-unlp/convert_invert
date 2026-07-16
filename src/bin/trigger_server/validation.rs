@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+use convert_invert::internals::query::query_manager::ResourceKind;
+
 use crate::errors::ApiError;
 
 /// Bounds derived from operational concerns: workers consume Soulseek listen ports
@@ -17,6 +19,9 @@ pub struct StartRequest {
     pub port_base: Option<u16>,
     pub run_id_prefix: Option<String>,
     pub playlist_id: Option<String>,
+    /// "playlist" (default) | "album" | "track". Selects which kind of Spotify resource
+    /// `playlist_id` names. Absent/unknown values fall back to "playlist".
+    pub resource_kind: Option<String>,
     pub chunk_size: Option<usize>,
     pub playlist_range_start: Option<usize>,
     pub playlist_range_end: Option<usize>,
@@ -29,6 +34,7 @@ pub struct StartRequestValidated {
     pub port_base: u16,
     pub run_id_prefix: String,
     pub playlist_id: String,
+    pub resource_kind: ResourceKind,
     pub chunk_size: usize,
     pub playlist_range: Option<(usize, usize)>,
     pub random_order: bool,
@@ -81,6 +87,11 @@ impl StartRequest {
         if playlist_id.trim().is_empty() {
             return Err(ApiError::BadRequest("playlist_id is empty".into()));
         }
+        let resource_kind = self
+            .resource_kind
+            .as_deref()
+            .map(ResourceKind::parse)
+            .unwrap_or_default();
 
         let playlist_range = match (self.playlist_range_start, self.playlist_range_end) {
             (Some(start), Some(end)) if start < end => Some((start, end)),
@@ -115,6 +126,7 @@ impl StartRequest {
             port_base,
             run_id_prefix,
             playlist_id,
+            resource_kind,
             chunk_size,
             playlist_range,
             random_order: self.random_order.unwrap_or(false),
@@ -163,6 +175,7 @@ mod tests {
             port_base: None,
             run_id_prefix: None,
             playlist_id: Some("playlist".to_string()),
+            resource_kind: None,
             chunk_size: None,
             playlist_range_start: None,
             playlist_range_end: None,

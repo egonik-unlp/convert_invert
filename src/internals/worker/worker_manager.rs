@@ -14,7 +14,7 @@ use tokio::task::JoinHandle;
 use crate::internals::context::context_manager::{Managers, RedisPool, Track, WorkerTuning};
 use crate::internals::database::DbPool;
 use crate::internals::database::manager::DatabaseManager;
-use crate::internals::query::query_manager::QueryManager;
+use crate::internals::query::query_manager::{QueryManager, ResourceKind};
 use crate::internals::search::search_manager::SearchItem;
 use crate::internals::utils::config::config_manager::Config;
 
@@ -45,6 +45,10 @@ pub struct LastRun {
     pub worker_count: usize,
     pub chunk_size: usize,
     pub port_base: u16,
+    /// "playlist" | "album" | "track". Defaulted for runs persisted before this field existed, so
+    /// old resume snapshots deserialize (and correctly resume as playlists).
+    #[serde(default)]
+    pub resource_kind: String,
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +59,8 @@ pub struct WorkerStartOptions {
     pub run_id_prefix: String,
     pub account_mode: String,
     pub playlist_id: String,
+    /// Whether `playlist_id` names a Spotify playlist, album, or single track.
+    pub resource_kind: ResourceKind,
     pub chunk_size: usize,
     pub playlist_range: Option<(usize, usize)>,
     pub random_order: bool,
@@ -121,9 +127,9 @@ impl WorkerSupervisor {
             base_config.search_timeout_secs,
         );
         let (playlist_name, playlist_tracks) = query_manager
-            .fetch_playlist_with_name()
+            .fetch_with_name(options.resource_kind)
             .await
-            .context("Fetch worker playlist")?;
+            .with_context(|| format!("Fetch worker {}", options.resource_kind))?;
         let download_subdir = sanitize_folder_name(&playlist_name)
             .unwrap_or_else(|| sanitize_folder_name(&options.playlist_id).unwrap_or_default());
         let playlist_tracks = apply_playlist_range(playlist_tracks, options.playlist_range);
@@ -152,6 +158,7 @@ impl WorkerSupervisor {
                 worker_count: options.worker_count,
                 chunk_size: options.chunk_size,
                 port_base: options.port_base,
+                resource_kind: options.resource_kind.as_str().to_string(),
             };
             if let Ok(json) = serde_json::to_string(&last_run) {
                 let _ = redis_con.set::<_, _, ()>(LAST_RUN_KEY, json);
@@ -175,6 +182,7 @@ impl WorkerSupervisor {
             max_search_passes_per_track = tuning.max_search_passes_per_track,
             max_requests_per_track = tuning.max_requests_per_track,
             playlist_id = %options.playlist_id,
+            resource_kind = %options.resource_kind,
             playlist = %playlist_name,
             download_subdir = %download_subdir,
             random_order = options.random_order,
