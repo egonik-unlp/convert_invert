@@ -145,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
                     .service(api::pipeline_state)
                     .service(api::pipeline_pause)
                     .service(api::pipeline_resume)
+                    .service(api::resolve)
                     .service(api::playlists)
                     .service(api::playlist)
                     .service(api::candidates)

@@ -42,6 +42,21 @@ impl std::fmt::Display for ResourceKind {
     }
 }
 
+/// Lightweight metadata for a Spotify resource, used to preview what a URL points at before a
+/// sync is started. Fetched without paginating the full track list, so it's cheap.
+#[derive(Debug, Clone)]
+pub struct ResolvedResource {
+    pub kind: ResourceKind,
+    pub id: String,
+    pub name: String,
+    /// Secondary line: the album/track artist, or the playlist owner.
+    pub subtitle: String,
+    /// Best available cover-art URL, if the resource has any images.
+    pub image: Option<String>,
+    /// Number of tracks (playlists and albums); `None` for a single track.
+    pub track_count: Option<u32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryManager {
     pub playlist_url: String,
@@ -95,6 +110,79 @@ impl QueryManager {
             ResourceKind::Playlist => self.fetch_playlist_with_name().await,
             ResourceKind::Album => self.fetch_album_with_name().await,
             ResourceKind::Track => self.fetch_track_with_name().await,
+        }
+    }
+
+    /// Fetch just the display metadata (name, artist/owner, cover art, track count) for whichever
+    /// resource `kind` names, without paginating its tracks. Powers the UI's live URL preview.
+    pub async fn resolve(self, kind: ResourceKind) -> anyhow::Result<ResolvedResource> {
+        let (client_id, client_secret) = self.spotify_client_credentials()?;
+        let spotify = spotify_rs::ClientCredsClient::authenticate(client_id, client_secret)
+            .await
+            .context("Authenticate Spotify client credentials")?;
+
+        match kind {
+            ResourceKind::Playlist => {
+                let id = parse_spotify_playlist_id(&self.playlist_url)?;
+                let playlist = spotify_rs::playlist(id.clone())
+                    .market("US")
+                    .get(&spotify)
+                    .await
+                    .context("Fetch Spotify playlist")?;
+                Ok(ResolvedResource {
+                    kind,
+                    id,
+                    name: playlist.name,
+                    subtitle: playlist
+                        .owner
+                        .display_name
+                        .filter(|name| !name.is_empty())
+                        .map(|owner| format!("Playlist by {owner}"))
+                        .unwrap_or_else(|| "Playlist".to_string()),
+                    image: first_image(playlist.images),
+                    track_count: Some(playlist.tracks.total),
+                })
+            }
+            ResourceKind::Album => {
+                let id = parse_spotify_album_id(&self.playlist_url)?;
+                let album = spotify_rs::album(id.clone())
+                    .market("US")
+                    .get(&spotify)
+                    .await
+                    .context("Fetch Spotify album")?;
+                Ok(ResolvedResource {
+                    kind,
+                    id,
+                    name: album.name,
+                    subtitle: album
+                        .artists
+                        .first()
+                        .map(|artist| artist.name.clone())
+                        .unwrap_or_default(),
+                    image: first_image(album.images),
+                    track_count: Some(album.total_tracks),
+                })
+            }
+            ResourceKind::Track => {
+                let id = parse_spotify_track_id(&self.playlist_url)?;
+                let track = spotify_rs::track(id.clone())
+                    .market("US")
+                    .get(&spotify)
+                    .await
+                    .context("Fetch Spotify track")?;
+                Ok(ResolvedResource {
+                    kind,
+                    id,
+                    name: track.name,
+                    subtitle: track
+                        .artists
+                        .first()
+                        .map(|artist| artist.name.clone())
+                        .unwrap_or_default(),
+                    image: first_image(track.album.images),
+                    track_count: None,
+                })
+            }
         }
     }
 
@@ -253,6 +341,20 @@ pub fn parse_spotify_album_id(input: &str) -> anyhow::Result<String> {
     parse_spotify_resource_id(trimmed, "album")
 }
 
+pub fn parse_spotify_playlist_id(input: &str) -> anyhow::Result<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("Spotify playlist URL is empty");
+    }
+    parse_spotify_resource_id(trimmed, "playlist")
+}
+
+/// Pick a cover-art URL from a Spotify image list. Spotify returns images largest-first; we take
+/// the first so the preview stays crisp, and `None` when the resource has no artwork.
+fn first_image(images: Vec<spotify_rs::model::Image>) -> Option<String> {
+    images.into_iter().next().map(|image| image.url)
+}
+
 /// Extract a Spotify resource id of the given `kind` ("track"/"album"/…) from an
 /// `open.spotify.com/<kind>/<id>` URL, a `spotify:<kind>:<id>` URI, or a bare 22-char id.
 fn parse_spotify_resource_id(trimmed: &str, kind: &str) -> anyhow::Result<String> {
@@ -302,6 +404,45 @@ mod tests {
     #[test]
     fn rejects_track_url_for_album_mode() {
         assert!(parse_spotify_album_id("https://open.spotify.com/track/abc").is_err());
+    }
+
+    // Live check against the real Spotify API. Ignored by default (needs CLIENT_ID/CLIENT_SECRET
+    // and network); run with:
+    //   set -a; . ../.env; set +a
+    //   cargo test --lib resolve_live -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn resolve_live_covers_all_kinds() {
+        use super::{QueryManager, ResolvedResource, ResourceKind};
+        let client_id = std::env::var("CLIENT_ID").ok();
+        let client_secret = std::env::var("CLIENT_SECRET").ok();
+
+        let resolve = |input: &str, kind| {
+            let qm = QueryManager::new(input.to_string(), client_id.clone(), client_secret.clone());
+            async move { qm.resolve(kind).await }
+        };
+
+        // "Rick Astley - Whenever You Need Somebody" album and its lead track; a public playlist.
+        let album: ResolvedResource = resolve("spotify:album:6N9PS4QXF1D0OWPk0Sxtb4", ResourceKind::Album)
+            .await
+            .expect("resolve album");
+        assert!(!album.name.is_empty());
+        assert!(album.image.is_some(), "album should have cover art");
+        assert!(album.track_count.unwrap_or(0) > 0);
+        println!("ALBUM  -> {} · {} · {:?} tracks · {:?}", album.name, album.subtitle, album.track_count, album.image);
+
+        let track = resolve("spotify:track:4PTG3Z6ehGkBFwjybzWkR8", ResourceKind::Track)
+            .await
+            .expect("resolve track");
+        assert!(!track.name.is_empty());
+        assert!(track.track_count.is_none());
+        println!("TRACK  -> {} · {} · {:?}", track.name, track.subtitle, track.image);
+
+        let playlist = resolve("1Y0xPsqLXBV9xy4imNGeDT", ResourceKind::Playlist)
+            .await
+            .expect("resolve playlist");
+        assert!(!playlist.name.is_empty());
+        println!("PLAYLIST -> {} · {} · {:?} tracks · {:?}", playlist.name, playlist.subtitle, playlist.track_count, playlist.image);
     }
 
     #[test]

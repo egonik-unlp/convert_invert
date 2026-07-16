@@ -6,6 +6,8 @@ use convert_invert::internals::context::context_manager::WorkerTuning;
 use convert_invert::internals::database::DbPool;
 use convert_invert::internals::database::schema;
 use convert_invert::internals::judge::judge_manager::JUDGE_THRESHOLD;
+use convert_invert::internals::query::query_manager::{QueryManager, ResourceKind};
+use convert_invert::internals::utils::config::config_manager::Config;
 use diesel::prelude::*;
 use diesel::sql_types::{Bool, Float4, Integer, Nullable, Text};
 use redis::Commands;
@@ -1960,6 +1962,62 @@ fn set_downloads_paused(state: &AppState, paused: bool) -> ApiResult<()> {
             .map_err(|err| ApiError::Internal(format!("redis del: {err}")))?;
     }
     Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct ResolveQuery {
+    /// A Spotify URL, URI, or bare id.
+    pub id: String,
+    /// "playlist" (default) | "album" | "track".
+    pub kind: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ResolveResponse {
+    pub kind: String,
+    pub id: String,
+    pub name: String,
+    pub subtitle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(rename = "trackCount", skip_serializing_if = "Option::is_none")]
+    pub track_count: Option<u32>,
+}
+
+/// Resolve a Spotify URL/id into its display metadata (name, artist/owner, cover art, track
+/// count) so the UI can preview what a pasted link points at before a sync is launched.
+#[get("/resolve")]
+pub async fn resolve(
+    _state: web::Data<AppState>,
+    query: web::Query<ResolveQuery>,
+) -> ApiResult<HttpResponse> {
+    let query = query.into_inner();
+    if query.id.trim().is_empty() {
+        return Err(ApiError::BadRequest("id is required".into()));
+    }
+    let kind = ResourceKind::parse(query.kind.as_deref().unwrap_or("playlist"));
+
+    let base_config = Config::try_from_env()
+        .map_err(|err| ApiError::Internal(format!("Failed to load config: {err}")))?;
+    let query_manager = QueryManager::new_with_timeout(
+        query.id,
+        base_config.client_id,
+        base_config.client_secret,
+        base_config.search_timeout_secs,
+    );
+
+    let resolved = query_manager.resolve(kind).await.map_err(|err| {
+        ApiError::BadRequest(format!("Could not resolve Spotify {kind}: {err}"))
+    })?;
+
+    Ok(HttpResponse::Ok().json(ResolveResponse {
+        kind: resolved.kind.as_str().to_string(),
+        id: resolved.id,
+        name: resolved.name,
+        subtitle: resolved.subtitle,
+        image: resolved.image,
+        track_count: resolved.track_count,
+    }))
 }
 
 #[get("/pipeline")]
